@@ -5,6 +5,7 @@ set -e
 mkdir -p app/src/main/java/de/pdfapp
 mv MainActivity.kt app/src/main/java/de/pdfapp/MainActivity.kt
 mv AndroidManifest.xml app/src/main/AndroidManifest.xml
+mv debug.keystore app/debug.keystore
 
 cat > settings.gradle.kts <<'EOF'
 pluginManagement {
@@ -46,6 +47,15 @@ plugins {
 android {
     namespace = "de.pdfapp"
     compileSdk = 34
+
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
 
     defaultConfig {
         applicationId = "de.pdfapp.pdfwerkzeug"

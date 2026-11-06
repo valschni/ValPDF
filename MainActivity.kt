@@ -7,14 +7,18 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.drawable.GradientDrawable
 import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -22,12 +26,15 @@ import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import android.util.LruCache
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
+import android.view.ViewConfiguration
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
-import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -52,7 +59,7 @@ private const val REQ_SAVE = 4
 /** Text einer Seite (klein geschrieben) plus Position jedes Zeichens (0..1 der Seitengröße). */
 class PageText(val low: String, val rects: Array<RectF?>)
 
-/** Ein Suchtreffer: Seite und die Markierungs-Rechtecke. */
+/** Ein Suchtreffer: Seite und die Markierungs-Rechtecke (0..1 der Seitengröße). */
 class Match(val page: Int, val rects: List<RectF>)
 
 /** Liest den Text einer Seite samt Positionen. */
@@ -91,33 +98,139 @@ class Collector : PDFTextStripper() {
     }
 }
 
-/** Zeigt eine Seite und malt Suchtreffer darüber. */
+/** Zeigt eine Seite (Basisbild + scharfer Ausschnitt beim Zoomen) und malt Suchtreffer darüber. */
 class PageView(ctx: Context) : View(ctx) {
     var bmp: Bitmap? = null
+    var tile: Bitmap? = null
+    var tileRect: RectF? = null
+    var zoom = 1f
+    var panX = 0f
     var hits: List<RectF> = emptyList()
     var current: List<RectF> = emptyList()
-    private val white = Paint()
+    var dark = false
+    private val back = Paint()
     private val yellow = Paint()
     private val orange = Paint()
+    private val plain = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val invert = Paint(Paint.FILTER_BITMAP_FLAG)
     private val dst = RectF()
 
     init {
-        white.color = Color.WHITE
         yellow.color = Color.argb(110, 255, 235, 59)
         orange.color = Color.argb(150, 255, 152, 0)
+        invert.colorFilter = ColorMatrixColorFilter(
+            ColorMatrix(
+                floatArrayOf(
+                    -0.85f, 0f, 0f, 0f, 232f,
+                    0f, -0.85f, 0f, 0f, 232f,
+                    0f, 0f, -0.85f, 0f, 232f,
+                    0f, 0f, 0f, 1f, 0f
+                )
+            )
+        )
     }
 
     override fun onDraw(canvas: Canvas) {
-        val w = width.toFloat()
-        val h = height.toFloat()
-        canvas.drawRect(0f, 0f, w, h, white)
+        val vw = width.toFloat()
+        val zW = vw * zoom
+        val zH = height.toFloat()
+        back.color = if (dark) Color.rgb(15, 15, 15) else Color.WHITE
+        canvas.drawRect(0f, 0f, vw, zH, back)
+        val paint = if (dark) invert else plain
         val b = bmp
         if (b != null) {
-            dst.set(0f, 0f, w, h)
-            canvas.drawBitmap(b, null, dst, null)
+            dst.set(-panX, 0f, zW - panX, zH)
+            canvas.drawBitmap(b, null, dst, paint)
         }
-        for (r in hits) canvas.drawRect(r.left * w, r.top * h, r.right * w, r.bottom * h, yellow)
-        for (r in current) canvas.drawRect(r.left * w, r.top * h, r.right * w, r.bottom * h, orange)
+        val t = tile
+        val tr = tileRect
+        if (t != null && tr != null && zoom > 1.05f) {
+            dst.set(tr.left * zW - panX, tr.top * zH, tr.right * zW - panX, tr.bottom * zH)
+            canvas.drawBitmap(t, null, dst, paint)
+        }
+        for (r in hits) canvas.drawRect(r.left * zW - panX, r.top * zH, r.right * zW - panX, r.bottom * zH, yellow)
+        for (r in current) canvas.drawRect(r.left * zW - panX, r.top * zH, r.right * zW - panX, r.bottom * zH, orange)
+    }
+}
+
+/** Seitenliste mit Zwei-Finger-Zoom, seitlichem Verschieben, Tippen und Doppeltippen. */
+class ZoomRecycler(ctx: Context) : RecyclerView(ctx) {
+    var allowPan: () -> Boolean = { false }
+    var onZoom: (Float, Float, Float) -> Unit = { _, _, _ -> }
+    var onPan: (Float) -> Unit = {}
+    var onTap: () -> Unit = {}
+    var onDoubleTapAt: (Float, Float) -> Unit = { _, _ -> }
+
+    private var blocked = false
+    private val slop = ViewConfiguration.get(ctx).scaledTouchSlop
+    private var downX = 0f
+    private var downY = 0f
+    private var downTime = 0L
+    private var moved = false
+    private var lastX = 0f
+    private var lastTapTime = 0L
+    private var lastTapX = 0f
+    private var lastTapY = 0f
+    private val tapRunnable = Runnable { onTap() }
+
+    private val scaleDetector = ScaleGestureDetector(
+        ctx,
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                onZoom(detector.scaleFactor, detector.focusX, detector.focusY)
+                return true
+            }
+        }
+    )
+
+    init {
+        scaleDetector.isQuickScaleEnabled = false
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(ev)
+        val a = ev.actionMasked
+        if (a == MotionEvent.ACTION_DOWN) {
+            blocked = false
+            downX = ev.x
+            downY = ev.y
+            downTime = ev.eventTime
+            moved = false
+            lastX = ev.x
+        }
+        if (ev.pointerCount > 1 || scaleDetector.isInProgress) {
+            moved = true
+            if (!blocked) {
+                blocked = true
+                val c = MotionEvent.obtain(ev)
+                c.action = MotionEvent.ACTION_CANCEL
+                super.dispatchTouchEvent(c)
+                c.recycle()
+            }
+            return true
+        }
+        if (blocked) {
+            if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) blocked = false
+            return true
+        }
+        if (a == MotionEvent.ACTION_MOVE) {
+            if (abs(ev.x - downX) > slop || abs(ev.y - downY) > slop) moved = true
+            if (moved && allowPan()) onPan(lastX - ev.x)
+            lastX = ev.x
+        } else if (a == MotionEvent.ACTION_UP && !moved && ev.eventTime - downTime < 350) {
+            val now = ev.eventTime
+            if (now - lastTapTime < 300 && abs(ev.x - lastTapX) < 80 && abs(ev.y - lastTapY) < 80) {
+                removeCallbacks(tapRunnable)
+                lastTapTime = 0L
+                onDoubleTapAt(ev.x, ev.y)
+            } else {
+                lastTapTime = now
+                lastTapX = ev.x
+                lastTapY = ev.y
+                postDelayed(tapRunnable, 300)
+            }
+        }
+        return super.dispatchTouchEvent(ev)
     }
 }
 
@@ -138,6 +251,7 @@ class MainActivity : Activity() {
     private var screenW = 1080
 
     @Volatile private var index: List<PageText>? = null
+    @Volatile private var indexFailed = false
     private var matches: List<Match> = emptyList()
     private var currentMatch = 0
     private var highlights: Map<Int, List<RectF>> = emptyMap()
@@ -145,17 +259,88 @@ class MainActivity : Activity() {
     private var pendingUris: List<Uri> = emptyList()
     private var pendingMode = 0
 
+    @Volatile private var zoom = 1f
+    private var panX = 0f
+    private val tileRunnable = Runnable { requestTiles() }
+
+    private var darkMode = false
+    private var statusText = ""
+
     private val cache = object : LruCache<Int, Bitmap>((Runtime.getRuntime().maxMemory() / 1024 / 6).toInt()) {
         override fun sizeOf(key: Int, value: Bitmap): Int = value.byteCount / 1024
     }
 
     private lateinit var status: TextView
     private lateinit var searchBox: EditText
-    private lateinit var navRow: LinearLayout
+    private lateinit var topBox: LinearLayout
+    private lateinit var menuPanel: LinearLayout
+    private lateinit var navBox: LinearLayout
     private lateinit var counter: TextView
-    private lateinit var pages: RecyclerView
+    private lateinit var emptyHint: TextView
+    private lateinit var pages: ZoomRecycler
     private lateinit var lm: LinearLayoutManager
     private lateinit var adapter: PageAdapter
+
+    // ------------------------------------------------------------ Farben & Hilfen
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    private fun bgBar(): Int = if (darkMode) Color.rgb(32, 33, 36) else Color.WHITE
+    private fun fg(): Int = if (darkMode) Color.rgb(235, 235, 235) else Color.rgb(25, 25, 25)
+    private fun sub(): Int = if (darkMode) Color.rgb(165, 165, 165) else Color.rgb(90, 90, 90)
+    private fun chipBg(): Int = if (darkMode) Color.rgb(60, 64, 67) else Color.rgb(228, 231, 236)
+    private fun fieldBg(): Int = if (darkMode) Color.rgb(48, 49, 52) else Color.rgb(245, 246, 248)
+
+    private fun toast(s: String, long: Boolean = true) {
+        Toast.makeText(this, s, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+    }
+
+    private fun setStatus(s: String) {
+        statusText = s
+        if (this::status.isInitialized) status.text = s
+    }
+
+    private fun chip(label: String, action: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = label
+        t.textSize = 16f
+        t.setTextColor(fg())
+        t.gravity = Gravity.CENTER
+        t.setPadding(dp(14), dp(10), dp(14), dp(10))
+        val g = GradientDrawable()
+        g.setColor(chipBg())
+        g.cornerRadius = dp(10).toFloat()
+        t.background = g
+        t.setOnClickListener { action() }
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lp.setMargins(dp(3), 0, dp(3), 0)
+        t.layoutParams = lp
+        return t
+    }
+
+    private fun menuItem(label: String, action: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = label
+        t.textSize = 17f
+        t.setTextColor(fg())
+        t.setPadding(dp(20), dp(15), dp(20), dp(15))
+        t.setOnClickListener { action() }
+        t.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        return t
+    }
+
+    private fun divider(): View {
+        val v = View(this)
+        v.setBackgroundColor(if (darkMode) Color.rgb(70, 72, 75) else Color.rgb(220, 222, 226))
+        v.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
+        return v
+    }
+
+    private fun hideKeyboard() {
+        if (!this::searchBox.isInitialized) return
+        val m = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        m.hideSoftInputFromWindow(searchBox.windowToken, 0)
+        searchBox.clearFocus()
+    }
 
     // ------------------------------------------------------------ Oberfläche
 
@@ -163,29 +348,79 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         PDFBoxResourceLoader.init(applicationContext)
         screenW = resources.displayMetrics.widthPixels
-        val den = resources.displayMetrics.density
-        val pad = (8 * den).toInt()
+        darkMode = getSharedPreferences("einstellungen", MODE_PRIVATE).getBoolean("dark", false)
+        statusText = "Noch keine PDF geöffnet."
+        buildUi()
+        openMenu()
+        handleIntent(intent)
+    }
 
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.WHITE)
+    private fun buildUi() {
+        val oldQuery = if (this::searchBox.isInitialized) searchBox.text.toString() else ""
+        val pad = dp(8)
 
-        val row1 = LinearLayout(this)
-        row1.orientation = LinearLayout.HORIZONTAL
-        row1.setPadding(pad, pad, pad, 0)
-        row1.addView(btn("Öffnen", 1f) { pick("application/pdf", REQ_OPEN) })
-        row1.addView(btn("Zusammenfügen", 1f) { pick("application/pdf", REQ_MERGE) })
-        row1.addView(btn("Bilder → PDF", 1f) { pick("image/*", REQ_IMAGES) })
-        root.addView(row1)
+        window.statusBarColor = bgBar()
+        window.navigationBarColor = if (darkMode) Color.rgb(18, 18, 18) else Color.WHITE
+        window.decorView.systemUiVisibility =
+            if (darkMode) 0 else (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR)
 
-        val row2 = LinearLayout(this)
-        row2.orientation = LinearLayout.HORIZONTAL
-        row2.gravity = Gravity.CENTER_VERTICAL
-        row2.setPadding(pad, 0, pad, 0)
+        // Seitenliste
+        pages = ZoomRecycler(this)
+        pages.allowPan = { zoom > 1.05f }
+        pages.onZoom = { f, x, y -> applyZoom(f, x, y) }
+        pages.onPan = { dx -> applyPan(dx) }
+        pages.onTap = { onPageTap() }
+        pages.onDoubleTapAt = { x, y ->
+            val target = if (zoom > 1.5f) 1f else 2.5f
+            applyZoom(target / zoom, x, y)
+        }
+        lm = LinearLayoutManager(this)
+        pages.layoutManager = lm
+        adapter = PageAdapter()
+        pages.adapter = adapter
+        pages.setBackgroundColor(if (darkMode) Color.rgb(8, 8, 8) else Color.rgb(200, 200, 200))
+        pages.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                if (newState == RecyclerView.SCROLL_STATE_DRAGGING) hideBar()
+                if (newState == RecyclerView.SCROLL_STATE_IDLE) scheduleTiles()
+            }
+        })
+
+        // Hinweis, solange keine PDF offen ist
+        emptyHint = TextView(this)
+        emptyHint.text = "Noch keine PDF geöffnet.\n\nTippe oben auf „☰ Menü“ und dann auf „PDF öffnen“."
+        emptyHint.gravity = Gravity.CENTER
+        emptyHint.textSize = 17f
+        emptyHint.setTextColor(sub())
+        emptyHint.setPadding(dp(32), 0, dp(32), 0)
+        emptyHint.visibility = if (pageCount == 0) View.VISIBLE else View.GONE
+
+        // Obere Leiste (Menü + Suche + Status + Menü-Liste)
+        topBox = LinearLayout(this)
+        topBox.orientation = LinearLayout.VERTICAL
+        topBox.setBackgroundColor(bgBar())
+        topBox.elevation = dp(6).toFloat()
+
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(pad, pad, pad, pad / 2)
+        row.addView(chip("☰ Menü") { toggleMenu() })
+
         searchBox = EditText(this)
-        searchBox.hint = "In der PDF suchen"
+        searchBox.hint = "Im Dokument suchen"
+        searchBox.setHintTextColor(sub())
+        searchBox.setTextColor(fg())
+        searchBox.textSize = 16f
         searchBox.setSingleLine(true)
         searchBox.imeOptions = EditorInfo.IME_ACTION_SEARCH
+        searchBox.setPadding(dp(12), dp(8), dp(12), dp(8))
+        val gb = GradientDrawable()
+        gb.setColor(fieldBg())
+        gb.cornerRadius = dp(10).toFloat()
+        gb.setStroke(dp(1), sub())
+        searchBox.background = gb
+        searchBox.setText(oldQuery)
         searchBox.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_SEARCH) {
                 doSearch()
@@ -194,43 +429,118 @@ class MainActivity : Activity() {
                 false
             }
         }
-        searchBox.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        row2.addView(searchBox)
-        row2.addView(btn("Suchen", 0f) { doSearch() })
-        root.addView(row2)
-
-        navRow = LinearLayout(this)
-        navRow.orientation = LinearLayout.HORIZONTAL
-        navRow.gravity = Gravity.CENTER_VERTICAL
-        navRow.setPadding(pad, 0, pad, 0)
-        counter = TextView(this)
-        counter.gravity = Gravity.CENTER
-        counter.textSize = 16f
-        counter.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        navRow.addView(btn("◀ Zurück", 0f) { step(-1) })
-        navRow.addView(counter)
-        navRow.addView(btn("Weiter ▶", 0f) { step(1) })
-        navRow.visibility = View.GONE
-        root.addView(navRow)
+        val lpS = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        lpS.setMargins(dp(4), 0, dp(4), 0)
+        row.addView(searchBox, lpS)
+        row.addView(chip("Suchen") { doSearch() })
+        topBox.addView(row)
 
         status = TextView(this)
-        status.textSize = 13f
-        status.setTextColor(Color.DKGRAY)
-        status.setPadding(pad * 2, pad / 2, pad * 2, pad / 2)
-        status.text = "Tippe oben auf „Öffnen“, um eine PDF zu wählen."
-        root.addView(status)
+        status.textSize = 12f
+        status.setTextColor(sub())
+        status.setPadding(pad * 2, 0, pad * 2, pad)
+        status.text = statusText
+        topBox.addView(status)
 
-        pages = RecyclerView(this)
-        lm = LinearLayoutManager(this)
-        pages.layoutManager = lm
-        adapter = PageAdapter()
-        pages.adapter = adapter
-        pages.setBackgroundColor(Color.rgb(200, 200, 200))
-        pages.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-        root.addView(pages)
+        menuPanel = LinearLayout(this)
+        menuPanel.orientation = LinearLayout.VERTICAL
+        menuPanel.visibility = View.GONE
+        menuPanel.addView(divider())
+        menuPanel.addView(menuItem("📂   PDF öffnen") {
+            closeMenu()
+            pick("application/pdf", REQ_OPEN)
+        })
+        menuPanel.addView(divider())
+        menuPanel.addView(menuItem("➕   PDFs zusammenfügen") {
+            closeMenu()
+            pick("application/pdf", REQ_MERGE)
+        })
+        menuPanel.addView(divider())
+        menuPanel.addView(menuItem("🖼   Bilder zu PDF") {
+            closeMenu()
+            pick("image/*", REQ_IMAGES)
+        })
+        menuPanel.addView(divider())
+        menuPanel.addView(menuItem(if (darkMode) "☀   Heller Modus" else "🌙   Dunkelmodus") { toggleDark() })
+        topBox.addView(menuPanel)
 
+        // Untere Leiste für Treffer-Navigation
+        navBox = LinearLayout(this)
+        navBox.orientation = LinearLayout.HORIZONTAL
+        navBox.gravity = Gravity.CENTER_VERTICAL
+        navBox.setPadding(pad, pad, pad, pad)
+        navBox.setBackgroundColor(if (darkMode) Color.argb(240, 32, 33, 36) else Color.argb(240, 255, 255, 255))
+        navBox.elevation = dp(6).toFloat()
+        navBox.addView(chip("◀") { step(-1) })
+        counter = TextView(this)
+        counter.gravity = Gravity.CENTER
+        counter.textSize = 15f
+        counter.setTextColor(fg())
+        counter.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        counter.text = if (matches.isEmpty()) "" else "Treffer ${currentMatch + 1} von ${matches.size}"
+        navBox.addView(counter)
+        navBox.addView(chip("▶") { step(1) })
+        navBox.addView(chip("✕") { clearSearch() })
+        navBox.visibility = if (matches.isEmpty()) View.GONE else View.VISIBLE
+
+        val root = FrameLayout(this)
+        root.setBackgroundColor(if (darkMode) Color.rgb(8, 8, 8) else Color.rgb(200, 200, 200))
+        root.addView(pages, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(
+            emptyHint,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER)
+        )
+        root.addView(
+            navBox,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
+        )
+        root.addView(
+            topBox,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP)
+        )
         setContentView(root)
-        handleIntent(intent)
+    }
+
+    private fun showBar() {
+        topBox.visibility = View.VISIBLE
+    }
+
+    private fun hideBar() {
+        hideKeyboard()
+        menuPanel.visibility = View.GONE
+        topBox.visibility = View.GONE
+    }
+
+    private fun openMenu() {
+        topBox.visibility = View.VISIBLE
+        menuPanel.visibility = View.VISIBLE
+    }
+
+    private fun closeMenu() {
+        menuPanel.visibility = View.GONE
+    }
+
+    private fun toggleMenu() {
+        if (menuPanel.visibility == View.VISIBLE) closeMenu() else openMenu()
+    }
+
+    private fun onPageTap() {
+        if (menuPanel.visibility == View.VISIBLE) {
+            hideBar()
+        } else if (topBox.visibility == View.VISIBLE) {
+            hideBar()
+        } else {
+            showBar()
+        }
+    }
+
+    private fun toggleDark() {
+        val pos = lm.findFirstVisibleItemPosition()
+        darkMode = !darkMode
+        getSharedPreferences("einstellungen", MODE_PRIVATE).edit().putBoolean("dark", darkMode).apply()
+        buildUi()
+        if (pos > 0) lm.scrollToPosition(pos)
+        openMenu()
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -241,6 +551,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         loadToken++
+        main.removeCallbacks(tileRunnable)
         synchronized(lock) {
             try {
                 renderer?.close()
@@ -255,25 +566,6 @@ class MainActivity : Activity() {
         if (i != null && i.action == Intent.ACTION_VIEW && u != null) openPdf(u)
     }
 
-    private fun btn(label: String, weight: Float, action: () -> Unit): Button {
-        val b = Button(this)
-        b.text = label
-        b.isAllCaps = false
-        b.setOnClickListener { action() }
-        val w = if (weight > 0f) 0 else ViewGroup.LayoutParams.WRAP_CONTENT
-        b.layoutParams = LinearLayout.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT, weight)
-        return b
-    }
-
-    private fun toast(s: String) {
-        Toast.makeText(this, s, Toast.LENGTH_LONG).show()
-    }
-
-    private fun hideKeyboard() {
-        val m = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        m.hideSoftInputFromWindow(searchBox.windowToken, 0)
-    }
-
     // ------------------------------------------------------------ Seitenanzeige
 
     inner class PageAdapter : RecyclerView.Adapter<VH>() {
@@ -284,11 +576,16 @@ class MainActivity : Activity() {
         }
 
         override fun onBindViewHolder(holder: VH, position: Int) {
-            val wPx = screenW
-            val hPx = (wPx * pageH[position] / pageW[position]).toInt()
-            val lp = RecyclerView.LayoutParams(wPx, hPx)
+            val lp = RecyclerView.LayoutParams(screenW, pageHeightPx(position))
             lp.bottomMargin = 6
             holder.v.layoutParams = lp
+            if (holder.v.tag != position) {
+                holder.v.tile = null
+                holder.v.tileRect = null
+            }
+            holder.v.zoom = zoom
+            holder.v.panX = panX
+            holder.v.dark = darkMode
             holder.v.hits = highlights[position] ?: emptyList()
             holder.v.current =
                 if (matches.isNotEmpty() && matches[currentMatch].page == position) matches[currentMatch].rects
@@ -347,11 +644,14 @@ class MainActivity : Activity() {
     private fun openPdf(uri: Uri) {
         loadToken++
         val token = loadToken
-        status.text = "Öffne PDF …"
-        navRow.visibility = View.GONE
+        setStatus("Öffne PDF …")
         matches = emptyList()
         highlights = emptyMap()
         index = null
+        indexFailed = false
+        zoom = 1f
+        panX = 0f
+        navBox.visibility = View.GONE
         val name = nameOf(uri)
         ioExec.execute {
             val f = File(cacheDir, "pdf_$token.pdf")
@@ -386,7 +686,9 @@ class MainActivity : Activity() {
                         pageCount = n
                         adapter.notifyDataSetChanged()
                         lm.scrollToPosition(0)
-                        status.text = "$name – $n Seiten – Text wird indexiert …"
+                        emptyHint.visibility = View.GONE
+                        setStatus("$name – $n Seiten – Text wird indexiert …")
+                        hideBar()
                     }
                 }
                 cacheDir.listFiles()?.forEach {
@@ -395,7 +697,8 @@ class MainActivity : Activity() {
             } catch (e: Throwable) {
                 main.post {
                     if (token == loadToken) {
-                        status.text = "PDF konnte nicht geöffnet werden (Passwortschutz oder defekte Datei?)"
+                        setStatus("PDF konnte nicht geöffnet werden (Passwortschutz oder defekte Datei?)")
+                        toast("PDF konnte nicht geöffnet werden (Passwortschutz oder defekte Datei?)")
                     }
                 }
                 return@execute
@@ -406,6 +709,8 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------ Volltext-Index
 
+    private fun errText(e: Throwable): String = e.javaClass.simpleName + ": " + (e.message ?: "")
+
     private fun buildIndex(f: File, token: Int, name: String) {
         try {
             PDDocument.load(f).use { doc ->
@@ -413,53 +718,126 @@ class MainActivity : Activity() {
                 val c = Collector()
                 val out = ArrayList<PageText>(n)
                 var chars = 0
+                var errors = 0
+                var firstError = ""
                 for (i in 1..n) {
                     if (token != loadToken) return
-                    val page = doc.getPage(i - 1)
-                    val box = page.cropBox
-                    var w = box.width
-                    var h = box.height
-                    val rot = page.rotation
-                    if (rot == 90 || rot == 270) {
-                        val t = w
-                        w = h
-                        h = t
+                    var low = ""
+                    var rects: Array<RectF?> = arrayOfNulls(0)
+                    try {
+                        val page = doc.getPage(i - 1)
+                        val box = page.cropBox
+                        var w = box.width
+                        var h = box.height
+                        val rot = page.rotation
+                        if (rot == 90 || rot == 270) {
+                            val t = w
+                            w = h
+                            h = t
+                        }
+                        c.sb.setLength(0)
+                        c.rs.clear()
+                        c.pw = if (w > 0f) w else 1f
+                        c.ph = if (h > 0f) h else 1f
+                        c.startPage = i
+                        c.endPage = i
+                        c.getText(doc)
+                        val s = c.sb.toString()
+                        chars += s.trim().length
+                        val lowChars = CharArray(s.length) { s[it].lowercaseChar() }
+                        low = String(lowChars)
+                        rects = c.rs.toTypedArray()
+                    } catch (e: Throwable) {
+                        errors++
+                        if (firstError.isEmpty()) firstError = errText(e)
                     }
-                    c.sb.setLength(0)
-                    c.rs.clear()
-                    c.pw = if (w > 0f) w else 1f
-                    c.ph = if (h > 0f) h else 1f
-                    c.startPage = i
-                    c.endPage = i
-                    c.getText(doc)
-                    val s = c.sb.toString()
-                    chars += s.trim().length
-                    val lowChars = CharArray(s.length) { s[it].lowercaseChar() }
-                    out.add(PageText(String(lowChars), c.rs.toTypedArray()))
+                    out.add(PageText(low, rects))
                     if (i % 5 == 0 || i == n) {
                         main.post {
-                            if (token == loadToken) status.text = "$name – Indexiere Seite $i/$n …"
+                            if (token == loadToken) setStatus("$name – Indexiere Seite $i/$n …")
                         }
                     }
                 }
                 if (token != loadToken) return
-                index = out
-                val scan = chars < n * 10
-                main.post {
-                    if (token == loadToken) {
-                        status.text = if (scan) {
-                            "$name – $n Seiten. Kaum Text gefunden: vermutlich ein Scan. Die Suche funktioniert dafür erst mit der Texterkennung (kommt in Version 2)."
-                        } else {
-                            "$name – $n Seiten – Suche bereit"
+                if (n > 0 && errors == n) {
+                    indexFailed = true
+                    main.post {
+                        if (token == loadToken) {
+                            setStatus("$name – Textindex nicht möglich ($firstError). Nutze Android-Suche.")
+                            toast("Textindex nicht möglich: $firstError")
+                        }
+                    }
+                } else {
+                    index = out
+                    val scan = chars < n * 10
+                    main.post {
+                        if (token == loadToken) {
+                            if (scan) {
+                                setStatus("$name – $n Seiten. Kaum Text gefunden: vermutlich ein Scan (Texterkennung kommt in Version 2).")
+                                toast("Kaum Text in dieser PDF gefunden – vermutlich ein Scan.")
+                            } else {
+                                setStatus("$name – $n Seiten – Suche bereit")
+                                toast("Suche bereit", false)
+                            }
                         }
                     }
                 }
             }
         } catch (e: Throwable) {
+            indexFailed = true
+            val msg = errText(e)
             main.post {
-                if (token == loadToken) status.text = "$name – Textsuche für diese Datei nicht möglich."
+                if (token == loadToken) {
+                    setStatus("$name – Textindex nicht möglich ($msg). Nutze Android-Suche.")
+                    toast("Textindex nicht möglich: $msg")
+                }
             }
         }
+    }
+
+    /** Ersatz-Suche über die in Android 15+ eingebaute PDF-Engine (per Reflection, damit sie nichts kaputt macht). */
+    private fun platformSearch(q: String, token: Int): List<Match>? {
+        if (Build.VERSION.SDK_INT < 35) return null
+        val r = renderer ?: return null
+        val method = try {
+            Class.forName("android.graphics.pdf.PdfRenderer\$Page").getMethod("searchText", String::class.java)
+        } catch (e: Throwable) {
+            return null
+        }
+        val out = ArrayList<Match>()
+        var failures = 0
+        for (p in 0 until pageCount) {
+            if (token != loadToken) return null
+            try {
+                synchronized(lock) {
+                    if (renderer !== r) return null
+                    val page = r.openPage(p)
+                    try {
+                        val res = method.invoke(page, q) as? List<*>
+                        if (res != null) {
+                            for (item in res) {
+                                if (item == null) continue
+                                val bl = item.javaClass.getMethod("getBounds").invoke(item) as? List<*>
+                                if (bl == null) continue
+                                val rects = ArrayList<RectF>()
+                                for (b in bl) {
+                                    if (b is RectF) {
+                                        rects.add(RectF(b.left / pageW[p], b.top / pageH[p], b.right / pageW[p], b.bottom / pageH[p]))
+                                    }
+                                }
+                                if (rects.isNotEmpty()) out.add(Match(p, rects))
+                            }
+                        }
+                    } finally {
+                        page.close()
+                    }
+                }
+            } catch (e: Exception) {
+                failures++
+            }
+        }
+        if (pageCount > 0 && failures == pageCount) return null
+        return out
     }
 
     // ------------------------------------------------------------ Suche
@@ -488,9 +866,17 @@ class MainActivity : Activity() {
         hideKeyboard()
         val raw = searchBox.text.toString().trim().replace(Regex("\\s+"), " ")
         if (raw.isEmpty()) return
+        if (pageCount == 0) {
+            toast("Bitte zuerst eine PDF öffnen.")
+            return
+        }
         val idx = index
         if (idx == null) {
-            toast("Der Text wird noch indexiert – bitte kurz warten.")
+            if (indexFailed) {
+                searchPlatform(raw)
+            } else {
+                toast("Der Text wird noch indexiert – bitte kurz warten.")
+            }
             return
         }
         val q = String(CharArray(raw.length) { raw[it].lowercaseChar() })
@@ -505,11 +891,29 @@ class MainActivity : Activity() {
                 from = i + q.length
             }
         }
+        showMatches(found, raw)
+    }
+
+    private fun searchPlatform(raw: String) {
+        val token = loadToken
+        toast("Suche läuft …", false)
+        ioExec.execute {
+            val res = platformSearch(raw, token)
+            main.post {
+                if (token == loadToken) {
+                    if (res == null) {
+                        toast("Die Textsuche ist für diese Datei auf diesem Gerät nicht verfügbar.")
+                    } else {
+                        showMatches(res, raw)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun showMatches(found: List<Match>, raw: String) {
         if (found.isEmpty()) {
-            matches = emptyList()
-            highlights = emptyMap()
-            navRow.visibility = View.GONE
-            adapter.notifyDataSetChanged()
+            clearSearch()
             toast("Keine Treffer für „$raw“")
             return
         }
@@ -517,8 +921,17 @@ class MainActivity : Activity() {
         for (m in found) map.getOrPut(m.page) { ArrayList() }.addAll(m.rects)
         matches = found
         highlights = map
-        navRow.visibility = View.VISIBLE
+        navBox.visibility = View.VISIBLE
         goTo(0)
+        hideBar()
+    }
+
+    private fun clearSearch() {
+        matches = emptyList()
+        highlights = emptyMap()
+        currentMatch = 0
+        navBox.visibility = View.GONE
+        adapter.notifyDataSetChanged()
     }
 
     private fun step(d: Int) {
@@ -529,11 +942,123 @@ class MainActivity : Activity() {
     private fun goTo(k: Int) {
         currentMatch = k
         counter.text = "Treffer ${k + 1} von ${matches.size}"
-        adapter.notifyDataSetChanged()
         val m = matches[k]
-        val pageHeightPx = screenW * pageH[m.page] / pageW[m.page]
-        val y = (m.rects.firstOrNull()?.top ?: 0f) * pageHeightPx
+        val first = m.rects.firstOrNull()
+        if (zoom > 1.05f && first != null) {
+            panX = first.centerX() * screenW * zoom - screenW / 2f
+            clampPan()
+        }
+        adapter.notifyDataSetChanged()
+        val y = (first?.top ?: 0f) * pageHeightPx(m.page)
         lm.scrollToPositionWithOffset(m.page, -(y - 300f).toInt())
+        scheduleTiles()
+    }
+
+    // ------------------------------------------------------------ Zoom
+
+    private fun pageHeightPx(pos: Int): Int = (screenW * zoom * pageH[pos] / pageW[pos]).toInt()
+
+    private fun clampPan() {
+        panX = panX.coerceIn(0f, maxOf(0f, (zoom - 1f) * screenW))
+    }
+
+    private fun applyZoom(factor: Float, fx: Float, fy: Float) {
+        if (pageCount == 0) return
+        var nz = (zoom * factor).coerceIn(1f, 5f)
+        if (nz < 1.03f) nz = 1f
+        if (abs(nz - zoom) < 0.001f) return
+        val child = pages.findChildViewUnder(fx, fy)
+        var pos = -1
+        var frac = 0f
+        if (child != null && child.height > 0) {
+            pos = pages.getChildAdapterPosition(child)
+            frac = (fy - child.top) / child.height.toFloat()
+        }
+        val f = nz / zoom
+        panX = (panX + fx) * f - fx
+        zoom = nz
+        if (zoom == 1f) panX = 0f
+        clampPan()
+        adapter.notifyDataSetChanged()
+        if (pos >= 0) lm.scrollToPositionWithOffset(pos, (fy - frac * pageHeightPx(pos)).toInt())
+        scheduleTiles()
+    }
+
+    private fun applyPan(dx: Float) {
+        val old = panX
+        panX += dx
+        clampPan()
+        if (panX == old) return
+        for (i in 0 until pages.childCount) {
+            val v = pages.getChildAt(i) as? PageView ?: continue
+            v.panX = panX
+            v.invalidate()
+        }
+        scheduleTiles()
+    }
+
+    private fun scheduleTiles() {
+        main.removeCallbacks(tileRunnable)
+        main.postDelayed(tileRunnable, 180)
+    }
+
+    /** Rendert für die gerade sichtbaren Seitenausschnitte eine scharfe Version in der aktuellen Vergrößerung. */
+    private fun requestTiles() {
+        if (pageCount == 0) return
+        if (zoom <= 1.05f) {
+            for (i in 0 until pages.childCount) {
+                val v = pages.getChildAt(i) as? PageView ?: continue
+                v.tile = null
+                v.tileRect = null
+                v.invalidate()
+            }
+            return
+        }
+        val r = renderer ?: return
+        val token = loadToken
+        val z = zoom
+        val zW = screenW * z
+        for (i in 0 until pages.childCount) {
+            val v = pages.getChildAt(i) as? PageView ?: continue
+            val pos = v.tag as? Int ?: continue
+            val vis = Rect()
+            if (!v.getLocalVisibleRect(vis)) continue
+            if (vis.height() < 20 || v.height <= 0) continue
+            val top = maxOf(0, vis.top - 120)
+            val bottom = minOf(v.height, vis.bottom + 120)
+            val th = bottom - top
+            if (th < 20) continue
+            val zH = v.height.toFloat()
+            val leftPx = panX
+            val frac = RectF(leftPx / zW, top / zH, (leftPx + screenW) / zW, bottom / zH)
+            renderExec.execute {
+                var result: Bitmap? = null
+                try {
+                    synchronized(lock) {
+                        if (token != loadToken || renderer !== r || abs(zoom - z) > 0.02f) return@execute
+                        val page = r.openPage(pos)
+                        val s = zW / page.width
+                        val b = Bitmap.createBitmap(screenW, th, Bitmap.Config.ARGB_8888)
+                        b.eraseColor(Color.WHITE)
+                        val mx = Matrix()
+                        mx.postScale(s, s)
+                        mx.postTranslate(-leftPx, -top.toFloat())
+                        page.render(b, null, mx, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        page.close()
+                        result = b
+                    }
+                } catch (e: Throwable) {
+                }
+                val done = result ?: return@execute
+                main.post {
+                    if (token == loadToken && v.tag == pos && abs(zoom - z) < 0.02f) {
+                        v.tile = done
+                        v.tileRect = frac
+                        v.invalidate()
+                    }
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ Auswahl & Speichern
@@ -594,7 +1119,7 @@ class MainActivity : Activity() {
     private fun writeResult(target: Uri) {
         val mode = pendingMode
         val uris = pendingUris
-        status.text = "Erstelle PDF …"
+        setStatus("Erstelle PDF …")
         ioExec.execute {
             try {
                 contentResolver.openOutputStream(target, "wt")!!.use { out ->
@@ -606,7 +1131,7 @@ class MainActivity : Activity() {
                 }
             } catch (e: Throwable) {
                 main.post {
-                    status.text = "Fehler beim Erstellen: ${e.message}"
+                    setStatus("Fehler beim Erstellen: ${e.message}")
                     toast("Fehler beim Erstellen: ${e.message}")
                 }
             }
