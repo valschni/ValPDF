@@ -1,7 +1,9 @@
 package de.pdfapp
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
+import android.content.res.Configuration
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -13,6 +15,7 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
@@ -24,11 +27,13 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
+import android.text.InputType
 import android.util.LruCache
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.ViewConfiguration
+import android.view.WindowManager
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
@@ -41,10 +46,30 @@ import android.widget.Toast
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.contentstream.PDFStreamEngine
+import com.tom_roush.pdfbox.contentstream.operator.Operator
+import com.tom_roush.pdfbox.contentstream.operator.state.Concatenate
+import com.tom_roush.pdfbox.contentstream.operator.state.Restore as PdfRestore
+import com.tom_roush.pdfbox.contentstream.operator.state.Save as PdfSave
+import com.tom_roush.pdfbox.cos.COSBase
+import com.tom_roush.pdfbox.cos.COSName
 import com.tom_roush.pdfbox.io.MemoryUsageSetting
 import com.tom_roush.pdfbox.multipdf.PDFMergerUtility
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPage
+import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
+import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
+import com.tom_roush.pdfbox.pdmodel.graphics.form.PDFormXObject
+import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
+import com.tom_roush.pdfbox.pdmodel.interactive.annotation.PDAnnotationWidget
+import com.tom_roush.pdfbox.pdmodel.interactive.form.PDCheckBox
+import com.tom_roush.pdfbox.pdmodel.interactive.form.PDChoice
+import com.tom_roush.pdfbox.pdmodel.interactive.form.PDComboBox
+import com.tom_roush.pdfbox.pdmodel.interactive.form.PDField
+import com.tom_roush.pdfbox.pdmodel.interactive.form.PDListBox
+import com.tom_roush.pdfbox.pdmodel.interactive.form.PDRadioButton
+import com.tom_roush.pdfbox.pdmodel.interactive.form.PDTerminalField
+import com.tom_roush.pdfbox.pdmodel.interactive.form.PDTextField
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
 import java.io.File
@@ -130,7 +155,60 @@ class Collector : PDFTextStripper() {
     }
 }
 
-/** Zeigt eine Seite (Basisbild + scharfer Ausschnitt beim Zoomen) und malt Suchtreffer darüber. */
+/** Eine Bearbeitung: kind 0 = freier Text, 1 = Formular-Text (mit weißer Fläche), 2 = Markierung (X). Koordinaten 0..1 der Seite. */
+class Edit(
+    val page: Int,
+    var left: Float,
+    var top: Float,
+    var right: Float,
+    var bottom: Float,
+    var text: String,
+    var size: Float,
+    val kind: Int,
+    val fieldId: String?,
+    val group: String?
+)
+
+/** Ein Formularfeld der PDF. type: 0 Text, 1 Kontrollkästchen, 2 Auswahlknopf, 3 Auswahlliste. */
+class FormField(val id: String, val group: String, val type: Int, val rect: RectF, val options: List<String>)
+
+/** Findet die Positionen aller Bilder auf einer Seite (in PDF-Koordinaten). */
+class ImageFinder : PDFStreamEngine() {
+    val boxes = ArrayList<FloatArray>()
+
+    init {
+        addOperator(Concatenate())
+        addOperator(PdfSave())
+        addOperator(PdfRestore())
+    }
+
+    override fun processOperator(operator: Operator, operands: MutableList<COSBase>) {
+        if ("Do" == operator.name) {
+            val name = if (operands.isNotEmpty()) operands[0] as? COSName else null
+            if (name != null) {
+                val xo = resources.getXObject(name)
+                if (xo is PDImageXObject) {
+                    val m = graphicsState.currentTransformationMatrix
+                    val a = m.scaleX
+                    val b = m.shearY
+                    val c = m.shearX
+                    val d = m.scaleY
+                    val e = m.translateX
+                    val f = m.translateY
+                    val xs = floatArrayOf(e, a + e, c + e, a + c + e)
+                    val ys = floatArrayOf(f, b + f, d + f, b + d + f)
+                    boxes.add(floatArrayOf(xs.min(), ys.min(), xs.max(), ys.max()))
+                } else if (xo is PDFormXObject) {
+                    showForm(xo)
+                }
+            }
+        } else {
+            super.processOperator(operator, operands)
+        }
+    }
+}
+
+/** Zeigt eine Seite (Basisbild + scharfer Ausschnitt beim Zoomen), Suchtreffer und Bearbeitungen. */
 class PageView(ctx: Context) : View(ctx) {
     var bmp: Bitmap? = null
     var tile: Bitmap? = null
@@ -140,16 +218,27 @@ class PageView(ctx: Context) : View(ctx) {
     var hits: List<RectF> = emptyList()
     var current: List<RectF> = emptyList()
     var dark = false
+    var imgRects: List<RectF> = emptyList()
+    var edits: List<Edit> = emptyList()
+    var fields: List<FormField> = emptyList()
+    var editOn = false
+    var pageWpt = 595f
+    var pageHpt = 842f
     private val back = Paint()
     private val yellow = Paint()
     private val orange = Paint()
     private val plain = Paint(Paint.FILTER_BITMAP_FLAG)
     private val invert = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val fieldPaint = Paint()
+    private val boxPaint = Paint()
+    private val tp = Paint(Paint.ANTI_ALIAS_FLAG)
     private val dst = RectF()
 
     init {
         yellow.color = Color.argb(110, 255, 235, 59)
         orange.color = Color.argb(150, 255, 152, 0)
+        fieldPaint.color = Color.argb(70, 33, 150, 243)
+        tp.typeface = Typeface.SANS_SERIF
         invert.colorFilter = ColorMatrixColorFilter(
             ColorMatrix(
                 floatArrayOf(
@@ -162,13 +251,7 @@ class PageView(ctx: Context) : View(ctx) {
         )
     }
 
-    override fun onDraw(canvas: Canvas) {
-        val vw = width.toFloat()
-        val zW = vw * zoom
-        val zH = height.toFloat()
-        back.color = if (dark) Color.rgb(15, 15, 15) else Color.WHITE
-        canvas.drawRect(0f, 0f, vw, zH, back)
-        val paint = if (dark) invert else plain
+    private fun drawBitmaps(canvas: Canvas, zW: Float, zH: Float, paint: Paint?) {
         val b = bmp
         if (b != null) {
             dst.set(-panX, 0f, zW - panX, zH)
@@ -180,8 +263,71 @@ class PageView(ctx: Context) : View(ctx) {
             dst.set(tr.left * zW - panX, tr.top * zH, tr.right * zW - panX, tr.bottom * zH)
             canvas.drawBitmap(t, null, dst, paint)
         }
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val vw = width.toFloat()
+        val zW = vw * zoom
+        val zH = height.toFloat()
+        back.color = if (dark) Color.rgb(15, 15, 15) else Color.WHITE
+        canvas.drawRect(0f, 0f, vw, zH, back)
+        drawBitmaps(canvas, zW, zH, if (dark) invert else plain)
+        if (dark) {
+            // Bilder behalten im Dunkelmodus ihre Originalfarben
+            for (r in imgRects) {
+                canvas.save()
+                canvas.clipRect(r.left * zW - panX, r.top * zH, r.right * zW - panX, r.bottom * zH)
+                drawBitmaps(canvas, zW, zH, plain)
+                canvas.restore()
+            }
+        }
         for (r in hits) canvas.drawRect(r.left * zW - panX, r.top * zH, r.right * zW - panX, r.bottom * zH, yellow)
         for (r in current) canvas.drawRect(r.left * zW - panX, r.top * zH, r.right * zW - panX, r.bottom * zH, orange)
+        if (editOn) {
+            for (f in fields) {
+                canvas.drawRect(f.rect.left * zW - panX, f.rect.top * zH, f.rect.right * zW - panX, f.rect.bottom * zH, fieldPaint)
+            }
+        }
+        for (e in edits) drawEdit(canvas, e, zW, zH)
+    }
+
+    private fun drawEdit(c: Canvas, e: Edit, zW: Float, zH: Float) {
+        val sc = zW / pageWpt
+        tp.color = if (dark) Color.rgb(235, 235, 235) else Color.BLACK
+        tp.typeface = Typeface.SANS_SERIF
+        when (e.kind) {
+            0 -> {
+                tp.textSize = e.size * sc
+                val lines = e.text.split("\n")
+                for (i in lines.indices) {
+                    val y = e.top * zH + (0.8f * e.size + i * 1.2f * e.size) * sc
+                    c.drawText(lines[i], e.left * zW - panX, y, tp)
+                }
+            }
+            1 -> {
+                val l = e.left * zW - panX
+                val t = e.top * zH
+                boxPaint.color = if (dark) Color.rgb(15, 15, 15) else Color.WHITE
+                c.drawRect(l, t, e.right * zW - panX, e.bottom * zH, boxPaint)
+                tp.textSize = e.size * sc
+                val lines = e.text.split("\n")
+                val h = (e.bottom - e.top) * zH
+                for (i in lines.indices) {
+                    val y = if (lines.size == 1) t + h / 2f + e.size * sc * 0.35f
+                    else t + (0.9f * e.size + i * 1.15f * e.size + 1.5f) * sc
+                    c.drawText(lines[i], l + 2f * sc, y, tp)
+                }
+            }
+            else -> {
+                val w = (e.right - e.left) * zW
+                val h = (e.bottom - e.top) * zH
+                tp.typeface = Typeface.DEFAULT_BOLD
+                tp.textSize = minOf(w, h) * 0.9f
+                val cx = (e.left + e.right) / 2f * zW - panX
+                val cy = (e.top + e.bottom) / 2f * zH
+                c.drawText("X", cx - tp.measureText("X") / 2f, cy + tp.textSize * 0.35f, tp)
+            }
+        }
     }
 }
 
@@ -190,7 +336,7 @@ class ZoomRecycler(ctx: Context) : RecyclerView(ctx) {
     var allowPan: () -> Boolean = { false }
     var onZoom: (Float, Float, Float) -> Unit = { _, _, _ -> }
     var onPan: (Float) -> Unit = {}
-    var onTap: () -> Unit = {}
+    var onTapAt: (Float, Float) -> Unit = { _, _ -> }
     var onDoubleTapAt: (Float, Float) -> Unit = { _, _ -> }
 
     private var blocked = false
@@ -203,7 +349,7 @@ class ZoomRecycler(ctx: Context) : RecyclerView(ctx) {
     private var lastTapTime = 0L
     private var lastTapX = 0f
     private var lastTapY = 0f
-    private val tapRunnable = Runnable { onTap() }
+    private val tapRunnable = Runnable { onTapAt(lastTapX, lastTapY) }
 
     private val scaleDetector = ScaleGestureDetector(
         ctx,
@@ -417,7 +563,7 @@ class MainActivity : Activity() {
         pages.allowPan = { zoom > 1.05f }
         pages.onZoom = { f, x, y -> applyZoom(f, x, y) }
         pages.onPan = { dx -> applyPan(dx) }
-        pages.onTap = { onPageTap() }
+        pages.onTapAt = { x, y -> onTapAt(x, y) }
         pages.onDoubleTapAt = { x, y ->
             val target = if (zoom > 1.5f) 1f else 2.5f
             applyZoom(target / zoom, x, y)
@@ -496,20 +642,30 @@ class MainActivity : Activity() {
         menuPanel.addView(divider())
         menuPanel.addView(menuItem("📂   PDF öffnen") {
             closeMenu()
-            pick("application/pdf", REQ_OPEN)
+            confirmDiscard { pick("application/pdf", REQ_OPEN) }
         })
         menuPanel.addView(divider())
         menuPanel.addView(menuItem("➕   PDFs zusammenfügen") {
             closeMenu()
-            pick("application/pdf", REQ_MERGE)
+            confirmDiscard { pick("application/pdf", REQ_MERGE) }
         })
         menuPanel.addView(divider())
         menuPanel.addView(menuItem("🖼   Bilder zu PDF") {
             closeMenu()
-            pick("image/*", REQ_IMAGES)
+            confirmDiscard { pick("image/*", REQ_IMAGES) }
         })
         menuPanel.addView(divider())
         menuPanel.addView(menuItem(if (darkMode) "☀   Heller Modus" else "🌙   Dunkelmodus") { toggleDark() })
+        menuPanel.addView(divider())
+        menuPanel.addView(menuItem("✏   Bearbeiten (Text, Formulare)") {
+            closeMenu()
+            setEditMode(true)
+        })
+        menuPanel.addView(divider())
+        menuPanel.addView(menuItem("💾   Bearbeitete PDF speichern") {
+            closeMenu()
+            saveEditsClicked()
+        })
         topBox.addView(menuPanel)
 
         // Untere Leiste für Treffer-Navigation
@@ -531,6 +687,26 @@ class MainActivity : Activity() {
         navBox.addView(chip("✕") { clearSearch() })
         navBox.visibility = if (matches.isEmpty() && !searchRunning) View.GONE else View.VISIBLE
 
+        editBar = LinearLayout(this)
+        editBar.orientation = LinearLayout.HORIZONTAL
+        editBar.gravity = Gravity.CENTER
+        editBar.setPadding(pad, pad, pad, pad)
+        editBar.setBackgroundColor(bgBar())
+        editBar.elevation = dp(6).toFloat()
+        editBar.addView(chip("☰") {
+            showBar()
+            openMenu()
+        })
+        editBar.addView(chip("↩ Rückgängig") { undoEdit() })
+        editBar.addView(chip("💾 Speichern") { saveEditsClicked() })
+        editBar.addView(chip("✕ Fertig") { setEditMode(false) })
+        editBar.visibility = if (editMode) View.VISIBLE else View.GONE
+
+        val bottomBox = LinearLayout(this)
+        bottomBox.orientation = LinearLayout.VERTICAL
+        bottomBox.addView(navBox)
+        bottomBox.addView(editBar)
+
         val root = FrameLayout(this)
         root.setBackgroundColor(if (darkMode) Color.rgb(8, 8, 8) else Color.rgb(200, 200, 200))
         root.addView(pages, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -539,7 +715,7 @@ class MainActivity : Activity() {
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER)
         )
         root.addView(
-            navBox,
+            bottomBox,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
         )
         root.addView(
@@ -665,6 +841,7 @@ class MainActivity : Activity() {
                 if (matches.isNotEmpty() && matches[currentMatch].page == position) matches[currentMatch].rects
                 else emptyList()
             holder.v.tag = position
+            applyOverlay(holder.v, position)
             val cached = cache.get(position)
             holder.v.bmp = cached
             holder.v.invalidate()
@@ -731,7 +908,15 @@ class MainActivity : Activity() {
         highlights = emptyMap()
         currentMatch = 0
         navBox.visibility = View.GONE
+        edits.clear()
+        formFields.clear()
+        formPending.clear()
+        imgRects.clear()
+        imgPending.clear()
+        editMode = false
+        editBar.visibility = View.GONE
         searchExec.execute { closeFallback() }
+        auxExec.execute { closeAux() }
     }
 
     private fun failLoad(token: Int, e: Throwable) {
@@ -745,7 +930,7 @@ class MainActivity : Activity() {
     }
 
     /** Kopiert die gewählte PDF in den App-Speicher (damit sie dauerhaft verfügbar bleibt) und öffnet sie. */
-    private fun openPdf(uri: Uri) {
+    private fun openPdf(uri: Uri, keep: Restore? = null) {
         val name = nameOf(uri)
         val target = nextDocFile()
         beginLoad("Öffne PDF …")
@@ -759,7 +944,7 @@ class MainActivity : Activity() {
                 failLoad(token, e)
                 return@execute
             }
-            loadRenderer(target, name, token, null)
+            loadRenderer(target, name, token, keep)
         }
     }
 
@@ -1145,6 +1330,587 @@ class MainActivity : Activity() {
         scheduleTiles()
     }
 
+    // ------------------------------------------------------------ Bearbeiten & Bilder im Dunkelmodus
+
+    private var editMode = false
+    private val edits = ArrayList<Edit>()
+    private val formFields = HashMap<Int, List<FormField>>()
+    private val formPending = HashSet<Int>()
+    private val imgRects = HashMap<Int, List<RectF>>()
+    private val imgPending = HashSet<Int>()
+    private val auxExec = Executors.newSingleThreadExecutor()
+    private var auxDoc: PDDocument? = null
+    private var auxPath: String? = null
+    private var auxFields: java.util.IdentityHashMap<Any, PDField>? = null
+    private lateinit var editBar: LinearLayout
+
+    private fun editsOf(p: Int): List<Edit> = edits.filter { it.page == p }
+
+    private fun applyOverlay(v: PageView, p: Int) {
+        v.edits = editsOf(p)
+        v.editOn = editMode
+        v.fields = if (editMode) (formFields[p] ?: emptyList()) else emptyList()
+        v.imgRects = if (darkMode) (imgRects[p] ?: emptyList()) else emptyList()
+        if (p < pageW.size) {
+            v.pageWpt = pageW[p]
+            v.pageHpt = pageH[p]
+        }
+        if (editMode) requestFields(p)
+        if (darkMode) requestImages(p)
+    }
+
+    private fun refreshVisible() {
+        for (i in 0 until pages.childCount) {
+            val v = pages.getChildAt(i) as? PageView ?: continue
+            val p = v.tag as? Int ?: continue
+            applyOverlay(v, p)
+            v.invalidate()
+        }
+    }
+
+    private fun refreshPage(p: Int) {
+        for (i in 0 until pages.childCount) {
+            val v = pages.getChildAt(i) as? PageView ?: continue
+            if (v.tag == p) {
+                applyOverlay(v, p)
+                v.invalidate()
+            }
+        }
+    }
+
+    private fun setEditMode(on: Boolean) {
+        if (on && pageCount == 0) {
+            toast("Bitte zuerst eine PDF öffnen.")
+            return
+        }
+        editMode = on
+        editBar.visibility = if (on) View.VISIBLE else View.GONE
+        if (on) {
+            hideBar()
+            toast("Bearbeiten: Tippe auf eine Stelle, um Text einzufügen. Blau markierte Felder sind Formularfelder. Zum Ändern oder Löschen auf den Text tippen.")
+        }
+        refreshVisible()
+    }
+
+    private fun undoEdit() {
+        if (edits.isEmpty()) {
+            toast("Nichts zum Rückgängigmachen.", false)
+            return
+        }
+        edits.removeAt(edits.size - 1)
+        refreshVisible()
+    }
+
+    private fun confirmDiscard(then: () -> Unit) {
+        if (edits.isEmpty()) {
+            then()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Nicht gespeicherte Änderungen")
+            .setMessage("Deine Bearbeitungen gehen verloren, wenn du eine andere Datei öffnest. Trotzdem fortfahren?")
+            .setPositiveButton("Verwerfen") { _, _ -> then() }
+            .setNegativeButton("Abbrechen", null)
+            .show()
+    }
+
+    private fun onTapAt(x: Float, y: Float) {
+        if (!editMode) {
+            onPageTap()
+            return
+        }
+        if (topBox.visibility == View.VISIBLE) {
+            hideBar()
+            return
+        }
+        val v = pages.findChildViewUnder(x, y) as? PageView ?: return
+        val p = v.tag as? Int ?: return
+        if (v.height <= 0) return
+        val fx = (x - v.left + panX) / (screenW * zoom)
+        val fy = (y - v.top) / v.height.toFloat()
+        editTap(p, fx, fy)
+    }
+
+    private fun editTap(p: Int, fx: Float, fy: Float) {
+        for (e in edits.asReversed()) {
+            if (e.page == p && hitEdit(e, fx, fy)) {
+                editExisting(e)
+                return
+            }
+        }
+        val fl = formFields[p]
+        if (fl != null) {
+            for (ff in fl) {
+                if (ff.rect.contains(fx, fy)) {
+                    fillField(ff, p)
+                    return
+                }
+            }
+        }
+        textDialog("Text einfügen", "", 12f, true, null) { text, size ->
+            edits.add(Edit(p, fx, fy, 0f, 0f, text, size, 0, null, null))
+            refreshVisible()
+        }
+    }
+
+    private fun hitEdit(e: Edit, fx: Float, fy: Float): Boolean {
+        if (e.kind != 0) return fx >= e.left && fx <= e.right && fy >= e.top && fy <= e.bottom
+        val pw = pageW[e.page]
+        val ph = pageH[e.page]
+        val lines = e.text.split("\n")
+        val tp = Paint()
+        tp.textSize = e.size
+        var maxW = 0f
+        for (l in lines) maxW = maxOf(maxW, tp.measureText(l))
+        val w = maxW / pw
+        val h = lines.size * 1.2f * e.size / ph
+        return fx >= e.left - 0.01f && fx <= e.left + w + 0.01f && fy >= e.top - 0.01f && fy <= e.top + h + 0.01f
+    }
+
+    private fun editExisting(e: Edit) {
+        val del: () -> Unit = {
+            edits.remove(e)
+            refreshVisible()
+        }
+        if (e.kind == 0) {
+            textDialog("Text bearbeiten", e.text, e.size, true, del) { text, size ->
+                e.text = text
+                e.size = size
+                refreshVisible()
+            }
+        } else if (e.kind == 1) {
+            val ff = formFields[e.page]?.firstOrNull { it.id == e.fieldId }
+            if (ff != null) {
+                fillField(ff, e.page)
+            } else {
+                textDialog("Feld bearbeiten", e.text, 0f, false, del) { text, _ ->
+                    e.text = text
+                    refreshVisible()
+                }
+            }
+        } else {
+            del()
+        }
+    }
+
+    private fun markEdit(ff: FormField, p: Int): Edit =
+        Edit(p, ff.rect.left, ff.rect.top, ff.rect.right, ff.rect.bottom, "X", 0f, 2, ff.id, ff.group)
+
+    private fun fitSize(ff: FormField, p: Int, text: String): Float {
+        val hPt = ff.rect.height() * pageH[p]
+        val wPt = ff.rect.width() * pageW[p] - 4f
+        var size = minOf(12f, maxOf(6f, hPt * 0.7f))
+        val tp = Paint()
+        tp.textSize = size
+        var maxW = 0f
+        for (l in text.split("\n")) maxW = maxOf(maxW, tp.measureText(l))
+        if (maxW > wPt && maxW > 0f && wPt > 0f) size = maxOf(5f, size * wPt / maxW)
+        return size
+    }
+
+    private fun setFieldText(ff: FormField, p: Int, text: String) {
+        edits.removeAll { it.fieldId == ff.id }
+        if (text.isNotBlank()) {
+            val size = fitSize(ff, p, text)
+            edits.add(Edit(p, ff.rect.left, ff.rect.top, ff.rect.right, ff.rect.bottom, text, size, 1, ff.id, ff.group))
+        }
+        refreshVisible()
+    }
+
+    private fun fillField(ff: FormField, p: Int) {
+        val existing = edits.firstOrNull { it.fieldId == ff.id }
+        if (ff.type == 0) {
+            val del: () -> Unit = {
+                edits.removeAll { it.fieldId == ff.id }
+                refreshVisible()
+            }
+            textDialog(ff.group, existing?.text ?: "", 0f, false, if (existing != null) del else null) { text, _ ->
+                setFieldText(ff, p, text)
+            }
+        } else if (ff.type == 1) {
+            if (existing != null) edits.remove(existing) else edits.add(markEdit(ff, p))
+            refreshVisible()
+        } else if (ff.type == 2) {
+            if (existing != null) {
+                edits.remove(existing)
+            } else {
+                edits.removeAll { it.kind == 2 && it.group == ff.group }
+                edits.add(markEdit(ff, p))
+            }
+            refreshVisible()
+        } else {
+            val opts = ff.options
+            if (opts.isEmpty()) {
+                toast("Dieses Feld hat keine Auswahlmöglichkeiten.")
+            } else {
+                val items = Array<CharSequence>(opts.size) { opts[it] }
+                AlertDialog.Builder(this)
+                    .setTitle(ff.group)
+                    .setItems(items) { _, i -> setFieldText(ff, p, opts[i]) }
+                    .show()
+            }
+        }
+    }
+
+    private fun textDialog(
+        title: String, initial: String, initialSize: Float, showSize: Boolean,
+        onDelete: (() -> Unit)?, onOk: (String, Float) -> Unit
+    ) {
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(20), dp(8), dp(20), 0)
+        val et = EditText(this)
+        et.setText(initial)
+        et.setSelection(et.text.length)
+        et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        et.minLines = 1
+        et.maxLines = 6
+        box.addView(et)
+        var sizeBox: EditText? = null
+        if (showSize) {
+            val label = TextView(this)
+            label.text = "Schriftgröße (pt)"
+            label.setPadding(0, dp(12), 0, 0)
+            box.addView(label)
+            val sb = EditText(this)
+            sb.inputType = InputType.TYPE_CLASS_NUMBER
+            sb.setText(initialSize.toInt().toString())
+            box.addView(sb)
+            sizeBox = sb
+        }
+        val b = AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(box)
+            .setPositiveButton("OK") { _, _ ->
+                val t = et.text.toString()
+                if (t.isNotBlank()) {
+                    val sz = (sizeBox?.text?.toString()?.toFloatOrNull() ?: initialSize).coerceIn(6f, 72f)
+                    onOk(t, sz)
+                }
+            }
+            .setNegativeButton("Abbrechen", null)
+        if (onDelete != null) b.setNeutralButton("Löschen") { _, _ -> onDelete() }
+        val d = b.create()
+        d.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+        d.show()
+    }
+
+    private fun saveEditsClicked() {
+        if (edits.isEmpty()) {
+            toast("Es gibt noch nichts zu speichern.")
+            return
+        }
+        pendingMode = 3
+        val base = if (currentName.endsWith(".pdf", true)) currentName.dropLast(4) else currentName
+        askSave(base + "_bearbeitet.pdf")
+    }
+
+    // ---- Hilfsdokument (eigene Instanz) für Bild- und Formularerkennung
+
+    private fun closeAux() {
+        try {
+            auxDoc?.close()
+        } catch (e: Exception) {
+        }
+        auxDoc = null
+        auxPath = null
+        auxFields = null
+    }
+
+    private fun openAux(f: File): PDDocument {
+        val cur = auxDoc
+        if (cur != null && auxPath == f.absolutePath) return cur
+        closeAux()
+        val d = PDDocument.load(f)
+        val m = java.util.IdentityHashMap<Any, PDField>()
+        try {
+            val form = d.documentCatalog.acroForm
+            if (form != null) {
+                for (fl in form.fieldTree) {
+                    if (fl is PDTerminalField) {
+                        for (w in fl.widgets) m[w.cosObject] = fl
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+        }
+        auxDoc = d
+        auxPath = f.absolutePath
+        auxFields = m
+        return d
+    }
+
+    private fun toDisplayRect(page: PDPage, x1: Float, y1: Float, x2: Float, y2: Float): RectF {
+        val box = page.cropBox
+        val w = if (box.width > 0f) box.width else 1f
+        val h = if (box.height > 0f) box.height else 1f
+        val rot = ((page.rotation % 360) + 360) % 360
+        var minX = 1f
+        var minY = 1f
+        var maxX = 0f
+        var maxY = 0f
+        val xs = floatArrayOf(x1, x2, x1, x2)
+        val ys = floatArrayOf(y1, y1, y2, y2)
+        for (i in 0 until 4) {
+            val u = (xs[i] - box.lowerLeftX) / w
+            val v = (ys[i] - box.lowerLeftY) / h
+            val dx: Float
+            val dy: Float
+            when (rot) {
+                90 -> {
+                    dx = v
+                    dy = u
+                }
+                180 -> {
+                    dx = 1f - u
+                    dy = v
+                }
+                270 -> {
+                    dx = 1f - v
+                    dy = 1f - u
+                }
+                else -> {
+                    dx = u
+                    dy = 1f - v
+                }
+            }
+            minX = minOf(minX, dx)
+            minY = minOf(minY, dy)
+            maxX = maxOf(maxX, dx)
+            maxY = maxOf(maxY, dy)
+        }
+        return RectF(maxOf(0f, minX), maxOf(0f, minY), minOf(1f, maxX), minOf(1f, maxY))
+    }
+
+    private fun detectImages(f: File, p: Int): List<RectF> {
+        val doc = openAux(f)
+        val page = doc.getPage(p)
+        val finder = ImageFinder()
+        finder.processPage(page)
+        val out = ArrayList<RectF>()
+        for (b in finder.boxes) {
+            val r = toDisplayRect(page, b[0], b[1], b[2], b[3])
+            val area = r.width() * r.height()
+            // ganzseitige Bilder (Scans) werden wie normaler Seiteninhalt abgedunkelt
+            if (area > 0.85f || area < 0.0002f) continue
+            out.add(r)
+        }
+        return out
+    }
+
+    private fun detectFields(f: File, p: Int): List<FormField> {
+        val doc = openAux(f)
+        val map = auxFields ?: return emptyList()
+        if (map.isEmpty()) return emptyList()
+        val page = doc.getPage(p)
+        val out = ArrayList<FormField>()
+        var k = 0
+        for (a in page.annotations) {
+            if (a !is PDAnnotationWidget) continue
+            val fld = map[a.cosObject] ?: continue
+            if (fld.isReadOnly) continue
+            val r = a.rectangle ?: continue
+            val type: Int
+            var options: List<String> = emptyList()
+            if (fld is PDTextField) {
+                type = 0
+            } else if (fld is PDCheckBox) {
+                type = 1
+            } else if (fld is PDRadioButton) {
+                type = 2
+            } else if (fld is PDComboBox || fld is PDListBox) {
+                type = 3
+                options = (fld as PDChoice).options
+            } else {
+                continue
+            }
+            val rect = toDisplayRect(page, r.lowerLeftX, r.lowerLeftY, r.upperRightX, r.upperRightY)
+            val name = fld.fullyQualifiedName ?: "Feld"
+            out.add(FormField("$name@$p#$k", name, type, rect, options))
+            k++
+        }
+        return out
+    }
+
+    private fun requestImages(p: Int) {
+        if (imgRects.containsKey(p) || !imgPending.add(p)) return
+        val f = currentFile
+        if (f == null) {
+            imgPending.remove(p)
+            return
+        }
+        val token = loadToken
+        auxExec.execute {
+            var res: List<RectF> = emptyList()
+            try {
+                if (token == loadToken) res = detectImages(f, p)
+            } catch (e: Throwable) {
+            }
+            main.post {
+                if (token == loadToken) {
+                    imgPending.remove(p)
+                    imgRects[p] = res
+                    refreshPage(p)
+                }
+            }
+        }
+    }
+
+    private fun requestFields(p: Int) {
+        if (formFields.containsKey(p) || !formPending.add(p)) return
+        val f = currentFile
+        if (f == null) {
+            formPending.remove(p)
+            return
+        }
+        val token = loadToken
+        auxExec.execute {
+            var res: List<FormField> = emptyList()
+            try {
+                if (token == loadToken) res = detectFields(f, p)
+            } catch (e: Throwable) {
+            }
+            main.post {
+                if (token == loadToken) {
+                    formPending.remove(p)
+                    formFields[p] = res
+                    refreshPage(p)
+                }
+            }
+        }
+    }
+
+    // ---- Speichern: Bearbeitungen in die PDF schreiben
+
+    private fun winAnsi(s: String): String {
+        val sb = StringBuilder()
+        for (ch in s) {
+            val c = ch.code
+            if (c in 32..126 || c in 160..255) {
+                sb.append(ch)
+            } else if (ch == '€') {
+                sb.append("EUR")
+            } else if (ch == '„' || ch == '“' || ch == '”') {
+                sb.append('"')
+            } else if (ch == '‚' || ch == '‘' || ch == '’') {
+                sb.append('\'')
+            } else if (ch == '–' || ch == '—') {
+                sb.append('-')
+            } else if (ch == '\t') {
+                sb.append("  ")
+            } else if (ch != '\r') {
+                sb.append('?')
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun saveEdited(src: File, list: List<Edit>, dw: FloatArray, dh: FloatArray, out: OutputStream) {
+        val doc = PDDocument.load(src)
+        try {
+            val byPage = list.groupBy { it.page }
+            for ((p, es) in byPage) {
+                val page = doc.getPage(p)
+                val cs = PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true)
+                try {
+                    for (e in es) drawEditPdf(cs, e, page, dw[p], dh[p])
+                } finally {
+                    cs.close()
+                }
+            }
+            doc.save(out)
+        } finally {
+            doc.close()
+        }
+    }
+
+    private fun putText(cs: PDPageContentStream, font: PDType1Font, text: String, size: Float, pos: FloatArray, rot: Int) {
+        if (text.isEmpty()) return
+        cs.beginText()
+        cs.setFont(font, size)
+        cs.setTextMatrix(com.tom_roush.pdfbox.util.Matrix.getRotateInstance(Math.toRadians(rot.toDouble()), pos[0], pos[1]))
+        cs.showText(text)
+        cs.endText()
+    }
+
+    private fun drawEditPdf(cs: PDPageContentStream, e: Edit, page: PDPage, dispW: Float, dispH: Float) {
+        val box = page.cropBox
+        val rot = ((page.rotation % 360) + 360) % 360
+
+        // Anzeige-Koordinaten (0..1, oben links) -> PDF-Koordinaten
+        fun user(fx: Float, fy: Float): FloatArray {
+            val u: Float
+            val v: Float
+            when (rot) {
+                90 -> {
+                    u = fy
+                    v = fx
+                }
+                180 -> {
+                    u = 1f - fx
+                    v = fy
+                }
+                270 -> {
+                    u = 1f - fy
+                    v = 1f - fx
+                }
+                else -> {
+                    u = fx
+                    v = 1f - fy
+                }
+            }
+            return floatArrayOf(box.lowerLeftX + u * box.width, box.lowerLeftY + v * box.height)
+        }
+
+        val font = PDType1Font.HELVETICA
+        val bold = PDType1Font.HELVETICA_BOLD
+        if (e.kind == 0) {
+            val lines = e.text.split("\n")
+            for (i in lines.indices) {
+                val by = e.top + (0.8f * e.size + i * 1.2f * e.size) / dispH
+                putText(cs, font, winAnsi(lines[i]), e.size, user(e.left, by), rot)
+            }
+        } else if (e.kind == 1) {
+            val a = user(e.left, e.top)
+            val b = user(e.right, e.bottom)
+            cs.setNonStrokingColor(255, 255, 255)
+            cs.addRect(minOf(a[0], b[0]), minOf(a[1], b[1]), Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]))
+            cs.fill()
+            cs.setNonStrokingColor(0, 0, 0)
+            val boxW = (e.right - e.left) * dispW
+            val boxH = (e.bottom - e.top) * dispH
+            val lines = e.text.split("\n").map { winAnsi(it) }
+            var size = e.size
+            var maxW = 0f
+            for (l in lines) maxW = maxOf(maxW, font.getStringWidth(l) / 1000f * size)
+            if (maxW > boxW - 4f && maxW > 0f) size = maxOf(5f, size * (boxW - 4f) / maxW)
+            for (i in lines.indices) {
+                val by = if (lines.size == 1) e.top + (boxH / 2f + size * 0.35f) / dispH
+                else e.top + (0.9f * size + i * 1.15f * size + 1.5f) / dispH
+                putText(cs, font, lines[i], size, user(e.left + 2f / dispW, by), rot)
+            }
+        } else {
+            val boxW = (e.right - e.left) * dispW
+            val boxH = (e.bottom - e.top) * dispH
+            val size = minOf(boxW, boxH) * 0.9f
+            val w = bold.getStringWidth("X") / 1000f * size
+            val cx = (e.left + e.right) / 2f
+            val cy = (e.top + e.bottom) / 2f
+            putText(cs, bold, "X", size, user(cx - (w / 2f) / dispW, cy + (size * 0.35f) / dispH), rot)
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        screenW = resources.displayMetrics.widthPixels
+        cache.evictAll()
+        clampPan()
+        if (pageCount > 0) {
+            adapter.notifyDataSetChanged()
+            scheduleTiles()
+        }
+    }
+
     // ------------------------------------------------------------ Zoom
 
     private fun pageHeightPx(pos: Int): Int = (screenW * zoom * pageH[pos] / pageW[pos]).toInt()
@@ -1310,15 +2076,32 @@ class MainActivity : Activity() {
     private fun writeResult(target: Uri) {
         val mode = pendingMode
         val uris = pendingUris
+        val src = currentFile
+        val snap = ArrayList<Edit>(edits)
+        val dw = pageW
+        val dh = pageH
+        val keep = Restore(
+            lm.findFirstVisibleItemPosition().coerceAtLeast(0),
+            pages.getChildAt(0)?.top ?: 0,
+            zoom,
+            panX
+        )
         setStatus("Erstelle PDF …")
         ioExec.execute {
             try {
                 contentResolver.openOutputStream(target, "wt")!!.use { out ->
-                    if (mode == 1) mergeTo(uris, out) else imagesTo(uris, out)
+                    if (mode == 1) {
+                        mergeTo(uris, out)
+                    } else if (mode == 3) {
+                        if (src != null) saveEdited(src, snap, dw, dh, out)
+                    } else {
+                        imagesTo(uris, out)
+                    }
+                    out.flush()
                 }
                 main.post {
                     toast("PDF gespeichert.")
-                    openPdf(target)
+                    if (mode == 3) openPdf(target, keep) else openPdf(target)
                 }
             } catch (e: Throwable) {
                 main.post {
