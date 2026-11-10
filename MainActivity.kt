@@ -44,6 +44,7 @@ import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.io.MemoryUsageSetting
 import com.tom_roush.pdfbox.multipdf.PDFMergerUtility
 import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
 import java.io.File
@@ -55,22 +56,53 @@ private const val REQ_OPEN = 1
 private const val REQ_MERGE = 2
 private const val REQ_IMAGES = 3
 private const val REQ_SAVE = 4
-
-/** Text einer Seite (klein geschrieben) plus Position jedes Zeichens (0..1 der Seitengröße). */
-class PageText(val low: String, val rects: Array<RectF?>)
+private const val MAX_MATCHES = 3000
 
 /** Ein Suchtreffer: Seite und die Markierungs-Rechtecke (0..1 der Seitengröße). */
 class Match(val page: Int, val rects: List<RectF>)
 
-/** Liest den Text einer Seite samt Positionen. */
+/** Wird geworfen, um eine laufende Textauswertung abzubrechen. */
+class SearchStop : RuntimeException()
+
+/** Wird geworfen, wenn genug Treffer gesammelt sind. */
+class MaxReached : RuntimeException()
+
+/** Liest den Text jeder Seite samt Zeichenpositionen und meldet am Seitenende. */
 class Collector : PDFTextStripper() {
     val sb = StringBuilder()
     val rs = ArrayList<RectF?>()
     var pw = 1f
     var ph = 1f
+    var shouldStop: () -> Boolean = { false }
+    var pageDone: (PDPage) -> Unit = {}
+
+    override fun startPage(page: PDPage?) {
+        sb.setLength(0)
+        rs.clear()
+        if (page != null) {
+            val box = page.cropBox
+            var w = box.width
+            var h = box.height
+            val rot = page.rotation
+            if (rot == 90 || rot == 270) {
+                val t = w
+                w = h
+                h = t
+            }
+            pw = if (w > 0f) w else 1f
+            ph = if (h > 0f) h else 1f
+        }
+        super.startPage(page)
+    }
+
+    override fun endPage(page: PDPage?) {
+        super.endPage(page)
+        if (page != null) pageDone(page)
+    }
 
     override fun writeString(text: String?, textPositions: MutableList<TextPosition>?) {
         if (text == null) return
+        if (shouldStop()) throw SearchStop()
         if (sb.isNotEmpty()) {
             sb.append(' ')
             rs.add(null)
@@ -250,8 +282,19 @@ class MainActivity : Activity() {
     private var pageH = FloatArray(0)
     private var screenW = 1080
 
-    @Volatile private var index: List<PageText>? = null
-    @Volatile private var indexFailed = false
+    private var currentFile: File? = null
+    private var currentName = ""
+    private val searchExec = Executors.newSingleThreadExecutor()
+    @Volatile private var searchToken = 0
+    private var searchRunning = false
+    private var searchPercent = 0
+    @Volatile private var sawText = false
+    @Volatile private var nativeState = 0
+    private var nativeMethod: java.lang.reflect.Method? = null
+    private var fbDoc: PDDocument? = null
+    private var fbPath: String? = null
+    private var fbIndex: java.util.IdentityHashMap<Any, Int>? = null
+    private var collector: Collector? = null
     private var matches: List<Match> = emptyList()
     private var currentMatch = 0
     private var highlights: Map<Int, List<RectF>> = emptyMap()
@@ -352,7 +395,12 @@ class MainActivity : Activity() {
         statusText = "Noch keine PDF geöffnet."
         buildUi()
         openMenu()
-        handleIntent(intent)
+        val first = intent
+        if (savedInstanceState == null && first != null && first.action == Intent.ACTION_VIEW && first.data != null) {
+            handleIntent(first)
+        } else {
+            restoreLast()
+        }
     }
 
     private fun buildUi() {
@@ -477,11 +525,11 @@ class MainActivity : Activity() {
         counter.textSize = 15f
         counter.setTextColor(fg())
         counter.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        counter.text = if (matches.isEmpty()) "" else "Treffer ${currentMatch + 1} von ${matches.size}"
+        updateCounter()
         navBox.addView(counter)
         navBox.addView(chip("▶") { step(1) })
         navBox.addView(chip("✕") { clearSearch() })
-        navBox.visibility = if (matches.isEmpty()) View.GONE else View.VISIBLE
+        navBox.visibility = if (matches.isEmpty() && !searchRunning) View.GONE else View.VISIBLE
 
         val root = FrameLayout(this)
         root.setBackgroundColor(if (darkMode) Color.rgb(8, 8, 8) else Color.rgb(200, 200, 200))
@@ -561,6 +609,32 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onPause() {
+        super.onPause()
+        saveState()
+    }
+
+    /** Merkt sich geöffnete PDF, Seite, Zoom und Suchbegriff, damit nichts verloren geht, wenn Android die App beendet. */
+    private fun saveState() {
+        val f = currentFile ?: return
+        if (pageCount == 0) return
+        val first = lm.findFirstVisibleItemPosition()
+        if (first < 0) return
+        val off = pages.getChildAt(0)?.top ?: 0
+        val e = getSharedPreferences("einstellungen", MODE_PRIVATE).edit()
+        e.putString("lastPath", f.absolutePath)
+        e.putString("lastName", currentName)
+        e.putInt("lastPos", first)
+        e.putInt("lastOff", off)
+        e.putFloat("lastZoom", zoom)
+        e.putFloat("lastPanX", panX)
+        e.putString("lastQuery", searchBox.text.toString())
+        e.putInt(docKey(currentName, f.length()), first)
+        e.apply()
+    }
+
+    private fun docKey(name: String, size: Long): String = "p_" + (name + "|" + size).hashCode()
+
     private fun handleIntent(i: Intent?) {
         val u = i?.data
         if (i != null && i.action == Intent.ACTION_VIEW && u != null) openPdf(u)
@@ -630,6 +704,8 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------ PDF öffnen
 
+    private class Restore(val pos: Int, val off: Int, val zoom: Float, val panX: Float)
+
     private fun nameOf(u: Uri): String {
         try {
             contentResolver.query(u, null, null, null, null)?.use { c ->
@@ -641,208 +717,132 @@ class MainActivity : Activity() {
         return u.lastPathSegment ?: "PDF"
     }
 
-    private fun openPdf(uri: Uri) {
-        loadToken++
-        val token = loadToken
-        setStatus("Öffne PDF …")
-        matches = emptyList()
-        highlights = emptyMap()
-        index = null
-        indexFailed = false
-        zoom = 1f
-        panX = 0f
-        navBox.visibility = View.GONE
-        val name = nameOf(uri)
-        ioExec.execute {
-            val f = File(cacheDir, "pdf_$token.pdf")
-            try {
-                contentResolver.openInputStream(uri)!!.use { input ->
-                    f.outputStream().use { out -> input.copyTo(out) }
-                }
-                val r = PdfRenderer(ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY))
-                val n = r.pageCount
-                val w = FloatArray(n)
-                val h = FloatArray(n)
-                for (i in 0 until n) {
-                    val p = r.openPage(i)
-                    w[i] = p.width.toFloat()
-                    h[i] = p.height.toFloat()
-                    p.close()
-                }
-                main.post {
-                    if (token != loadToken) {
-                        r.close()
-                    } else {
-                        synchronized(lock) {
-                            try {
-                                renderer?.close()
-                            } catch (e: Exception) {
-                            }
-                            renderer = r
-                        }
-                        cache.evictAll()
-                        pageW = w
-                        pageH = h
-                        pageCount = n
-                        adapter.notifyDataSetChanged()
-                        lm.scrollToPosition(0)
-                        emptyHint.visibility = View.GONE
-                        setStatus("$name – $n Seiten – Text wird indexiert …")
-                        hideBar()
-                    }
-                }
-                cacheDir.listFiles()?.forEach {
-                    if (it.name.startsWith("pdf_") && it != f) it.delete()
-                }
-            } catch (e: Throwable) {
-                main.post {
-                    if (token == loadToken) {
-                        setStatus("PDF konnte nicht geöffnet werden (Passwortschutz oder defekte Datei?)")
-                        toast("PDF konnte nicht geöffnet werden (Passwortschutz oder defekte Datei?)")
-                    }
-                }
-                return@execute
-            }
-            buildIndex(f, token, name)
-        }
-    }
-
-    // ------------------------------------------------------------ Volltext-Index
+    private fun nextDocFile(): File =
+        File(filesDir, if (currentFile?.name == "doc_0.pdf") "doc_1.pdf" else "doc_0.pdf")
 
     private fun errText(e: Throwable): String = e.javaClass.simpleName + ": " + (e.message ?: "")
 
-    private fun buildIndex(f: File, token: Int, name: String) {
-        try {
-            PDDocument.load(f).use { doc ->
-                val n = doc.numberOfPages
-                val c = Collector()
-                val out = ArrayList<PageText>(n)
-                var chars = 0
-                var errors = 0
-                var firstError = ""
-                for (i in 1..n) {
-                    if (token != loadToken) return
-                    var low = ""
-                    var rects: Array<RectF?> = arrayOfNulls(0)
-                    try {
-                        val page = doc.getPage(i - 1)
-                        val box = page.cropBox
-                        var w = box.width
-                        var h = box.height
-                        val rot = page.rotation
-                        if (rot == 90 || rot == 270) {
-                            val t = w
-                            w = h
-                            h = t
-                        }
-                        c.sb.setLength(0)
-                        c.rs.clear()
-                        c.pw = if (w > 0f) w else 1f
-                        c.ph = if (h > 0f) h else 1f
-                        c.startPage = i
-                        c.endPage = i
-                        c.getText(doc)
-                        val s = c.sb.toString()
-                        chars += s.trim().length
-                        val lowChars = CharArray(s.length) { s[it].lowercaseChar() }
-                        low = String(lowChars)
-                        rects = c.rs.toTypedArray()
-                    } catch (e: Throwable) {
-                        errors++
-                        if (firstError.isEmpty()) firstError = errText(e)
-                    }
-                    out.add(PageText(low, rects))
-                    if (i % 5 == 0 || i == n) {
-                        main.post {
-                            if (token == loadToken) setStatus("$name – Indexiere Seite $i/$n …")
-                        }
-                    }
-                }
-                if (token != loadToken) return
-                if (n > 0 && errors == n) {
-                    indexFailed = true
-                    main.post {
-                        if (token == loadToken) {
-                            setStatus("$name – Textindex nicht möglich ($firstError). Nutze Android-Suche.")
-                            toast("Textindex nicht möglich: $firstError")
-                        }
-                    }
-                } else {
-                    index = out
-                    val scan = chars < n * 10
-                    main.post {
-                        if (token == loadToken) {
-                            if (scan) {
-                                setStatus("$name – $n Seiten. Kaum Text gefunden: vermutlich ein Scan (Texterkennung kommt in Version 2).")
-                                toast("Kaum Text in dieser PDF gefunden – vermutlich ein Scan.")
-                            } else {
-                                setStatus("$name – $n Seiten – Suche bereit")
-                                toast("Suche bereit", false)
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Throwable) {
-            indexFailed = true
-            val msg = errText(e)
-            main.post {
-                if (token == loadToken) {
-                    setStatus("$name – Textindex nicht möglich ($msg). Nutze Android-Suche.")
-                    toast("Textindex nicht möglich: $msg")
-                }
+    private fun beginLoad(msg: String) {
+        loadToken++
+        searchToken++
+        searchRunning = false
+        setStatus(msg)
+        matches = emptyList()
+        highlights = emptyMap()
+        currentMatch = 0
+        navBox.visibility = View.GONE
+        searchExec.execute { closeFallback() }
+    }
+
+    private fun failLoad(token: Int, e: Throwable) {
+        main.post {
+            if (token == loadToken) {
+                val msg = "PDF konnte nicht geöffnet werden (Passwortschutz oder defekte Datei?)"
+                setStatus(msg)
+                toast(msg)
             }
         }
     }
 
-    /** Ersatz-Suche über die in Android 15+ eingebaute PDF-Engine (per Reflection, damit sie nichts kaputt macht). */
-    private fun platformSearch(q: String, token: Int): List<Match>? {
-        if (Build.VERSION.SDK_INT < 35) return null
-        val r = renderer ?: return null
-        val method = try {
-            Class.forName("android.graphics.pdf.PdfRenderer\$Page").getMethod("searchText", String::class.java)
-        } catch (e: Throwable) {
-            return null
-        }
-        val out = ArrayList<Match>()
-        var failures = 0
-        for (p in 0 until pageCount) {
-            if (token != loadToken) return null
+    /** Kopiert die gewählte PDF in den App-Speicher (damit sie dauerhaft verfügbar bleibt) und öffnet sie. */
+    private fun openPdf(uri: Uri) {
+        val name = nameOf(uri)
+        val target = nextDocFile()
+        beginLoad("Öffne PDF …")
+        val token = loadToken
+        ioExec.execute {
             try {
-                synchronized(lock) {
-                    if (renderer !== r) return null
-                    val page = r.openPage(p)
-                    try {
-                        val res = method.invoke(page, q) as? List<*>
-                        if (res != null) {
-                            for (item in res) {
-                                if (item == null) continue
-                                val bl = item.javaClass.getMethod("getBounds").invoke(item) as? List<*>
-                                if (bl == null) continue
-                                val rects = ArrayList<RectF>()
-                                for (b in bl) {
-                                    if (b is RectF) {
-                                        rects.add(RectF(b.left / pageW[p], b.top / pageH[p], b.right / pageW[p], b.bottom / pageH[p]))
-                                    }
-                                }
-                                if (rects.isNotEmpty()) out.add(Match(p, rects))
-                            }
-                        }
-                    } finally {
-                        page.close()
-                    }
+                contentResolver.openInputStream(uri)!!.use { input ->
+                    target.outputStream().use { out -> input.copyTo(out) }
                 }
-            } catch (e: Exception) {
-                failures++
+            } catch (e: Throwable) {
+                failLoad(token, e)
+                return@execute
             }
+            loadRenderer(target, name, token, null)
         }
-        if (pageCount > 0 && failures == pageCount) return null
-        return out
+    }
+
+    /** Öffnet beim Start die zuletzt gelesene PDF an der alten Stelle. */
+    private fun restoreLast() {
+        val p = getSharedPreferences("einstellungen", MODE_PRIVATE)
+        val path = p.getString("lastPath", null) ?: return
+        val f = File(path)
+        if (!f.exists()) return
+        val name = p.getString("lastName", "PDF") ?: "PDF"
+        val rs = Restore(p.getInt("lastPos", 0), p.getInt("lastOff", 0), p.getFloat("lastZoom", 1f), p.getFloat("lastPanX", 0f))
+        searchBox.setText(p.getString("lastQuery", "") ?: "")
+        beginLoad("Öffne $name …")
+        val token = loadToken
+        ioExec.execute { loadRenderer(f, name, token, rs) }
+    }
+
+    private fun loadRenderer(f: File, name: String, token: Int, rs: Restore?) {
+        try {
+            val r = PdfRenderer(ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY))
+            val n = r.pageCount
+            val w = FloatArray(n)
+            val h = FloatArray(n)
+            for (i in 0 until n) {
+                if (token != loadToken) {
+                    r.close()
+                    return
+                }
+                val p = r.openPage(i)
+                w[i] = p.width.toFloat()
+                h[i] = p.height.toFloat()
+                p.close()
+            }
+            main.post {
+                if (token != loadToken) {
+                    r.close()
+                } else {
+                    synchronized(lock) {
+                        try {
+                            renderer?.close()
+                        } catch (e: Exception) {
+                        }
+                        renderer = r
+                    }
+                    cache.evictAll()
+                    currentFile = f
+                    currentName = name
+                    pageW = w
+                    pageH = h
+                    pageCount = n
+                    val saved = getSharedPreferences("einstellungen", MODE_PRIVATE).getInt(docKey(name, f.length()), -1)
+                    if (rs != null) {
+                        zoom = rs.zoom.coerceIn(1f, 5f)
+                        panX = rs.panX
+                    } else {
+                        zoom = 1f
+                        panX = 0f
+                    }
+                    clampPan()
+                    adapter.notifyDataSetChanged()
+                    if (rs != null) {
+                        lm.scrollToPositionWithOffset(rs.pos.coerceIn(0, n - 1), rs.off)
+                    } else {
+                        lm.scrollToPositionWithOffset(if (saved in 0 until n) saved else 0, 0)
+                    }
+                    emptyHint.visibility = View.GONE
+                    setStatus("$name – $n Seiten")
+                    hideBar()
+                    filesDir.listFiles()?.forEach {
+                        if (it.name.startsWith("doc_") && it != f) it.delete()
+                    }
+                    if (zoom > 1.05f) scheduleTiles()
+                    if (rs == null && saved > 0) toast("Weiter bei Seite ${saved + 1}", false)
+                }
+            }
+        } catch (e: Throwable) {
+            failLoad(token, e)
+        }
     }
 
     // ------------------------------------------------------------ Suche
 
-    private fun mergeRects(rs: Array<RectF?>, s: Int, e: Int): List<RectF> {
+    private fun mergeRects(rs: List<RectF?>, s: Int, e: Int): List<RectF> {
         val out = ArrayList<RectF>()
         var cur: RectF? = null
         for (k in s until e) {
@@ -866,67 +866,258 @@ class MainActivity : Activity() {
         hideKeyboard()
         val raw = searchBox.text.toString().trim().replace(Regex("\\s+"), " ")
         if (raw.isEmpty()) return
-        if (pageCount == 0) {
+        val f = currentFile
+        if (pageCount == 0 || f == null) {
             toast("Bitte zuerst eine PDF öffnen.")
             return
         }
-        val idx = index
-        if (idx == null) {
-            if (indexFailed) {
-                searchPlatform(raw)
-            } else {
-                toast("Der Text wird noch indexiert – bitte kurz warten.")
-            }
-            return
-        }
-        val q = String(CharArray(raw.length) { raw[it].lowercaseChar() })
-        val found = ArrayList<Match>()
-        for (p in idx.indices) {
-            val pt = idx[p]
-            var from = 0
-            while (true) {
-                val i = pt.low.indexOf(q, from)
-                if (i < 0) break
-                found.add(Match(p, mergeRects(pt.rects, i, i + q.length)))
-                from = i + q.length
-            }
-        }
-        showMatches(found, raw)
+        searchToken++
+        val st = searchToken
+        val token = loadToken
+        val n = pageCount
+        val start = lm.findFirstVisibleItemPosition().coerceIn(0, n - 1)
+        matches = emptyList()
+        highlights = emptyMap()
+        currentMatch = 0
+        searchRunning = true
+        searchPercent = 0
+        adapter.notifyDataSetChanged()
+        navBox.visibility = View.VISIBLE
+        updateCounter()
+        hideBar()
+        searchExec.execute { runSearch(raw, st, token, f, start, n) }
     }
 
-    private fun searchPlatform(raw: String) {
-        val token = loadToken
-        toast("Suche läuft …", false)
-        ioExec.execute {
-            val res = platformSearch(raw, token)
-            main.post {
-                if (token == loadToken) {
-                    if (res == null) {
-                        toast("Die Textsuche ist für diese Datei auf diesem Gerät nicht verfügbar.")
-                    } else {
-                        showMatches(res, raw)
+    private fun findNativeMethod(): java.lang.reflect.Method? = try {
+        Class.forName("android.graphics.pdf.PdfRenderer\$Page").getMethod("searchText", String::class.java)
+    } catch (e: Throwable) {
+        null
+    }
+
+    /** Suche über die in Android 15+ eingebaute PDF-Engine (nativ, schnell). Gibt null zurück, wenn sie nicht verfügbar ist. */
+    private fun nativeSearchPage(m: java.lang.reflect.Method, q: String, p: Int, r: PdfRenderer): List<Match>? {
+        var result: List<Match>? = null
+        try {
+            synchronized(lock) {
+                if (renderer === r) {
+                    val page = r.openPage(p)
+                    try {
+                        val res = m.invoke(page, q) as? List<*>
+                        val out = ArrayList<Match>()
+                        if (res != null) {
+                            for (item in res) {
+                                if (item == null) continue
+                                val bl = item.javaClass.getMethod("getBounds").invoke(item) as? List<*>
+                                if (bl == null) continue
+                                val rects = ArrayList<RectF>()
+                                for (b in bl) {
+                                    if (b is RectF) {
+                                        rects.add(RectF(b.left / pageW[p], b.top / pageH[p], b.right / pageW[p], b.bottom / pageH[p]))
+                                    }
+                                }
+                                if (rects.isNotEmpty()) out.add(Match(p, rects))
+                            }
+                        }
+                        result = out
+                    } finally {
+                        page.close()
                     }
                 }
             }
+        } catch (e: Throwable) {
+            result = null
+        }
+        return result
+    }
+
+    private fun closeFallback() {
+        try {
+            fbDoc?.close()
+        } catch (e: Exception) {
+        }
+        fbDoc = null
+        fbPath = null
+        fbIndex = null
+    }
+
+    private fun openFallback(f: File): PDDocument {
+        val cur = fbDoc
+        if (cur != null && fbPath == f.absolutePath) return cur
+        closeFallback()
+        val d = PDDocument.load(f)
+        val m = java.util.IdentityHashMap<Any, Int>()
+        var i = 0
+        for (pg in d.pages) {
+            m[pg.cosObject] = i
+            i++
+        }
+        fbDoc = d
+        fbPath = f.absolutePath
+        fbIndex = m
+        return d
+    }
+
+    /** Ersatzsuche mit PDFBox: ein einziger Durchlauf ab der aktuellen Seite, Treffer erscheinen laufend. */
+    private fun fallbackSearch(
+        q: String, st: Int, token: Int, f: File, start: Int, n: Int,
+        found: ArrayList<Match>, progress: (Int) -> Unit
+    ) {
+        val doc = openFallback(f)
+        val idx = fbIndex ?: return
+        val c = collector ?: Collector()
+        collector = c
+        c.shouldStop = { st != searchToken || token != loadToken }
+        c.pageDone = { page ->
+            val p = idx[page.cosObject]
+            if (p != null) {
+                val low = String(CharArray(c.sb.length) { c.sb[it].lowercaseChar() })
+                if (low.isNotBlank()) sawText = true
+                var from = 0
+                while (true) {
+                    val i = low.indexOf(q, from)
+                    if (i < 0) break
+                    found.add(Match(p, mergeRects(c.rs, i, i + q.length)))
+                    from = i + q.length
+                }
+                val done = if (p >= start) p - start + 1 else (n - start) + p + 1
+                progress(done * 100 / n)
+                if (found.size >= MAX_MATCHES) throw MaxReached()
+            }
+        }
+        c.startPage = start + 1
+        c.endPage = n
+        c.getText(doc)
+        if (start > 0) {
+            c.startPage = 1
+            c.endPage = start
+            c.getText(doc)
         }
     }
 
-    private fun showMatches(found: List<Match>, raw: String) {
-        if (found.isEmpty()) {
-            clearSearch()
-            toast("Keine Treffer für „$raw“")
+    private fun runSearch(raw: String, st: Int, token: Int, f: File, start: Int, n: Int) {
+        val q = String(CharArray(raw.length) { raw[it].lowercaseChar() })
+        val found = ArrayList<Match>()
+        var lastPost = 0L
+        sawText = false
+        var usedNative = false
+
+        fun alive(): Boolean = st == searchToken && token == loadToken
+        fun post(percent: Int, done: Boolean, note: String) {
+            val snap = ArrayList<Match>(found)
+            main.post { if (alive()) applyMatches(snap, percent, done, note) }
+        }
+        fun maybePost(percent: Int) {
+            val now = System.currentTimeMillis()
+            if (now - lastPost > 400) {
+                lastPost = now
+                post(percent, false, "")
+            }
+        }
+
+        val r = renderer
+        if (r != null && Build.VERSION.SDK_INT >= 35 && nativeState >= 0) {
+            val m = nativeMethod ?: findNativeMethod()
+            nativeMethod = m
+            if (m == null) {
+                nativeState = -1
+            } else {
+                var fails = 0
+                var ok = false
+                var i = 0
+                while (i < n) {
+                    if (!alive()) return
+                    val p = (start + i) % n
+                    val res = nativeSearchPage(m, q, p, r)
+                    if (res == null) {
+                        fails++
+                        if (!ok && fails >= 3) {
+                            nativeState = -1
+                            found.clear()
+                            break
+                        }
+                    } else {
+                        ok = true
+                        nativeState = 1
+                        found.addAll(res)
+                    }
+                    i++
+                    if (found.size >= MAX_MATCHES) break
+                    maybePost(i * 100 / n)
+                }
+                if (nativeState != -1) usedNative = true
+            }
+        }
+
+        if (!usedNative) {
+            try {
+                fallbackSearch(q, st, token, f, start, n, found) { pct -> maybePost(pct) }
+            } catch (e: SearchStop) {
+                return
+            } catch (e: MaxReached) {
+                // genug Treffer gesammelt
+            } catch (e: Throwable) {
+                val msg = errText(e)
+                main.post {
+                    if (alive()) {
+                        searchRunning = false
+                        navBox.visibility = if (matches.isEmpty()) View.GONE else View.VISIBLE
+                        updateCounter()
+                        toast("Textsuche nicht möglich: $msg")
+                    }
+                }
+                return
+            }
+        }
+        if (!alive()) return
+        var note = ""
+        if (!usedNative && !sawText) note = "Die PDF enthält vermutlich keinen durchsuchbaren Text (Scan)."
+        if (found.size >= MAX_MATCHES) note = "Mehr als $MAX_MATCHES Treffer – Anzeige gekürzt, bitte genauer suchen."
+        post(100, true, note)
+    }
+
+    private fun updateCounter() {
+        counter.text = when {
+            matches.isEmpty() -> if (searchRunning) "Suche läuft … $searchPercent %" else ""
+            searchRunning -> "Treffer ${currentMatch + 1} von ${matches.size}+  ·  Suche $searchPercent %"
+            else -> "Treffer ${currentMatch + 1} von ${matches.size}"
+        }
+    }
+
+    private fun applyMatches(list: List<Match>, percent: Int, done: Boolean, note: String) {
+        val wasEmpty = matches.isEmpty()
+        val selected = if (currentMatch in matches.indices) matches[currentMatch] else null
+        val ordered = if (done) list.sortedBy { it.page } else list
+        matches = ordered
+        val map = HashMap<Int, ArrayList<RectF>>()
+        for (m in ordered) map.getOrPut(m.page) { ArrayList() }.addAll(m.rects)
+        highlights = map
+        searchPercent = percent
+        searchRunning = !done
+        if (ordered.isEmpty()) {
+            currentMatch = 0
+            if (done) {
+                navBox.visibility = View.GONE
+                toast("Keine Treffer für „${searchBox.text.toString().trim()}“. $note".trim())
+            }
+            updateCounter()
+            adapter.notifyDataSetChanged()
             return
         }
-        val map = HashMap<Int, ArrayList<RectF>>()
-        for (m in found) map.getOrPut(m.page) { ArrayList() }.addAll(m.rects)
-        matches = found
-        highlights = map
         navBox.visibility = View.VISIBLE
-        goTo(0)
-        hideBar()
+        if (wasEmpty) {
+            goTo(0)
+        } else {
+            val k = if (selected != null) ordered.indexOf(selected) else -1
+            currentMatch = if (k >= 0) k else 0
+            updateCounter()
+            adapter.notifyDataSetChanged()
+        }
+        if (done && note.isNotBlank()) toast(note)
     }
 
     private fun clearSearch() {
+        searchToken++
+        searchRunning = false
         matches = emptyList()
         highlights = emptyMap()
         currentMatch = 0
@@ -941,7 +1132,7 @@ class MainActivity : Activity() {
 
     private fun goTo(k: Int) {
         currentMatch = k
-        counter.text = "Treffer ${k + 1} von ${matches.size}"
+        updateCounter()
         val m = matches[k]
         val first = m.rects.firstOrNull()
         if (zoom > 1.05f && first != null) {

@@ -100,6 +100,10 @@ dependencies {
 }
 EOF
 
+# Versionsnummer wächst bei jedem Bauen automatisch (nötig fürs Drüberinstallieren)
+sed -i "s/versionCode = 4/versionCode = $((100 + ${GITHUB_RUN_NUMBER:-0}))/" app/build.gradle.kts
+sed -i "s/versionName = \"4.0\"/versionName = \"5.${GITHUB_RUN_NUMBER:-0}\"/" app/build.gradle.kts
+
 # ---- Logo (QuackReader-Ente) ----
 cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
 <?xml version="1.0" encoding="utf-8"?>
