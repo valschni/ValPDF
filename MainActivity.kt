@@ -9,6 +9,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LightingColorFilter
+import android.graphics.Path
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
@@ -39,6 +41,8 @@ import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.ImageView
+import android.widget.ScrollView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -60,6 +64,7 @@ import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
 import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
 import com.tom_roush.pdfbox.pdmodel.graphics.form.PDFormXObject
+import com.tom_roush.pdfbox.pdmodel.graphics.image.LosslessFactory
 import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
 import com.tom_roush.pdfbox.pdmodel.interactive.annotation.PDAnnotationWidget
 import com.tom_roush.pdfbox.pdmodel.interactive.form.PDCheckBox
@@ -81,6 +86,7 @@ private const val REQ_OPEN = 1
 private const val REQ_MERGE = 2
 private const val REQ_IMAGES = 3
 private const val REQ_SAVE = 4
+private const val REQ_SIGIMG = 5
 private const val MAX_MATCHES = 3000
 
 /** Ein Suchtreffer: Seite und die Markierungs-Rechtecke (0..1 der Seitengröße). */
@@ -155,7 +161,7 @@ class Collector : PDFTextStripper() {
     }
 }
 
-/** Eine Bearbeitung: kind 0 = freier Text, 1 = Formular-Text (mit weißer Fläche), 2 = Markierung (X). Koordinaten 0..1 der Seite. */
+/** Eine Bearbeitung: kind 0 = freier Text, 1 = Formular-Text (mit weißer Fläche), 2 = Markierung (X), 3 = Signatur. Koordinaten 0..1 der Seite. */
 class Edit(
     val page: Int,
     var left: Float,
@@ -167,7 +173,10 @@ class Edit(
     val kind: Int,
     val fieldId: String?,
     val group: String?
-)
+) {
+    var sig: Bitmap? = null
+    var sigPath: String? = null
+}
 
 /** Ein Formularfeld der PDF. type: 0 Text, 1 Kontrollkästchen, 2 Auswahlknopf, 3 Auswahlliste. */
 class FormField(val id: String, val group: String, val type: Int, val rect: RectF, val options: List<String>)
@@ -218,6 +227,7 @@ class PageView(ctx: Context) : View(ctx) {
     var hits: List<RectF> = emptyList()
     var current: List<RectF> = emptyList()
     var dark = false
+    var sepia = false
     var imgRects: List<RectF> = emptyList()
     var edits: List<Edit> = emptyList()
     var fields: List<FormField> = emptyList()
@@ -229,15 +239,22 @@ class PageView(ctx: Context) : View(ctx) {
     private val orange = Paint()
     private val plain = Paint(Paint.FILTER_BITMAP_FLAG)
     private val invert = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val fieldPaint = Paint()
+    private val paper = Paint(Paint.FILTER_BITMAP_FLAG)
     private val boxPaint = Paint()
+    private val markFill = Paint()
+    private val markLine = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val sigPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val sigLight = LightingColorFilter(0x000000, 0xEBEBEB)
     private val tp = Paint(Paint.ANTI_ALIAS_FLAG)
     private val dst = RectF()
+    private val sigDst = RectF()
+    private val dens = ctx.resources.displayMetrics.density
 
     init {
         yellow.color = Color.argb(110, 255, 235, 59)
         orange.color = Color.argb(150, 255, 152, 0)
-        fieldPaint.color = Color.argb(70, 33, 150, 243)
+        markLine.style = Paint.Style.STROKE
+        markLine.strokeWidth = 1.5f * dens
         tp.typeface = Typeface.SANS_SERIF
         invert.colorFilter = ColorMatrixColorFilter(
             ColorMatrix(
@@ -245,6 +262,17 @@ class PageView(ctx: Context) : View(ctx) {
                     -0.85f, 0f, 0f, 0f, 232f,
                     0f, -0.85f, 0f, 0f, 232f,
                     0f, 0f, -0.85f, 0f, 232f,
+                    0f, 0f, 0f, 1f, 0f
+                )
+            )
+        )
+        // warmer Papierton für den Lesemodus
+        paper.colorFilter = ColorMatrixColorFilter(
+            ColorMatrix(
+                floatArrayOf(
+                    0.97f, 0f, 0f, 0f, 0f,
+                    0f, 0.92f, 0f, 0f, 0f,
+                    0f, 0f, 0.80f, 0f, 0f,
                     0f, 0f, 0f, 1f, 0f
                 )
             )
@@ -269,9 +297,10 @@ class PageView(ctx: Context) : View(ctx) {
         val vw = width.toFloat()
         val zW = vw * zoom
         val zH = height.toFloat()
-        back.color = if (dark) Color.rgb(15, 15, 15) else Color.WHITE
+        back.color = if (dark) Color.rgb(15, 15, 15) else if (sepia) Color.rgb(247, 235, 204) else Color.WHITE
         canvas.drawRect(0f, 0f, vw, zH, back)
-        drawBitmaps(canvas, zW, zH, if (dark) invert else plain)
+        val pp = if (dark) invert else if (sepia) paper else plain
+        drawBitmaps(canvas, zW, zH, pp)
         if (dark) {
             // Bilder behalten im Dunkelmodus ihre Originalfarben
             for (r in imgRects) {
@@ -285,10 +314,18 @@ class PageView(ctx: Context) : View(ctx) {
         for (r in current) canvas.drawRect(r.left * zW - panX, r.top * zH, r.right * zW - panX, r.bottom * zH, orange)
         if (editOn) {
             for (f in fields) {
-                canvas.drawRect(f.rect.left * zW - panX, f.rect.top * zH, f.rect.right * zW - panX, f.rect.bottom * zH, fieldPaint)
+                mark(canvas, f.rect.left * zW - panX, f.rect.top * zH, f.rect.right * zW - panX, f.rect.bottom * zH, Color.rgb(33, 150, 243))
             }
         }
         for (e in edits) drawEdit(canvas, e, zW, zH)
+    }
+
+    /** Farbige Markierung (Füllung + Rahmen), nur in der Anzeige, nicht in der gespeicherten PDF. */
+    private fun mark(c: Canvas, l: Float, t: Float, r: Float, b: Float, color: Int) {
+        markFill.color = Color.argb(55, Color.red(color), Color.green(color), Color.blue(color))
+        markLine.color = Color.argb(230, Color.red(color), Color.green(color), Color.blue(color))
+        c.drawRect(l, t, r, b, markFill)
+        c.drawRect(l, t, r, b, markLine)
     }
 
     private fun drawEdit(c: Canvas, e: Edit, zW: Float, zH: Float) {
@@ -299,16 +336,27 @@ class PageView(ctx: Context) : View(ctx) {
             0 -> {
                 tp.textSize = e.size * sc
                 val lines = e.text.split("\n")
+                val l = e.left * zW - panX
+                val t = e.top * zH
+                if (editOn) {
+                    var maxW = 0f
+                    for (s in lines) maxW = maxOf(maxW, tp.measureText(s))
+                    val pad = 3f * dens
+                    mark(c, l - pad, t - pad, l + maxW + pad, t + lines.size * 1.2f * e.size * sc + pad, Color.rgb(255, 160, 0))
+                }
                 for (i in lines.indices) {
-                    val y = e.top * zH + (0.8f * e.size + i * 1.2f * e.size) * sc
-                    c.drawText(lines[i], e.left * zW - panX, y, tp)
+                    val y = t + (0.8f * e.size + i * 1.2f * e.size) * sc
+                    c.drawText(lines[i], l, y, tp)
                 }
             }
             1 -> {
                 val l = e.left * zW - panX
                 val t = e.top * zH
+                val r = e.right * zW - panX
+                val b = e.bottom * zH
                 boxPaint.color = if (dark) Color.rgb(15, 15, 15) else Color.WHITE
-                c.drawRect(l, t, e.right * zW - panX, e.bottom * zH, boxPaint)
+                c.drawRect(l, t, r, b, boxPaint)
+                if (editOn) mark(c, l, t, r, b, Color.rgb(46, 160, 67))
                 tp.textSize = e.size * sc
                 val lines = e.text.split("\n")
                 val h = (e.bottom - e.top) * zH
@@ -317,6 +365,19 @@ class PageView(ctx: Context) : View(ctx) {
                     else t + (0.9f * e.size + i * 1.15f * e.size + 1.5f) * sc
                     c.drawText(lines[i], l + 2f * sc, y, tp)
                 }
+            }
+            3 -> {
+                val l = e.left * zW - panX
+                val t = e.top * zH
+                val r = e.right * zW - panX
+                val b = e.bottom * zH
+                val s = e.sig
+                if (s != null) {
+                    sigPaint.colorFilter = if (dark) sigLight else null
+                    sigDst.set(l, t, r, b)
+                    c.drawBitmap(s, null, sigDst, sigPaint)
+                }
+                if (editOn) mark(c, l, t, r, b, Color.rgb(156, 39, 176))
             }
             else -> {
                 val w = (e.right - e.left) * zW
@@ -331,15 +392,20 @@ class PageView(ctx: Context) : View(ctx) {
     }
 }
 
-/** Seitenliste mit Zwei-Finger-Zoom, seitlichem Verschieben, Tippen und Doppeltippen. */
+/** Seitenliste mit Zwei-Finger-Zoom, seitlichem Verschieben, Tippen, Doppeltippen und Ziehen von Bearbeitungen. */
 class ZoomRecycler(ctx: Context) : RecyclerView(ctx) {
     var allowPan: () -> Boolean = { false }
     var onZoom: (Float, Float, Float) -> Unit = { _, _, _ -> }
     var onPan: (Float) -> Unit = {}
     var onTapAt: (Float, Float) -> Unit = { _, _ -> }
     var onDoubleTapAt: (Float, Float) -> Unit = { _, _ -> }
+    var onDragStart: (Float, Float) -> Boolean = { _, _ -> false }
+    var onDragMove: (Float, Float) -> Unit = { _, _ -> }
+    var onDragEnd: () -> Unit = {}
 
     private var blocked = false
+    private var dragCandidate = false
+    private var dragging = false
     private val slop = ViewConfiguration.get(ctx).scaledTouchSlop
     private var downX = 0f
     private var downY = 0f
@@ -370,14 +436,21 @@ class ZoomRecycler(ctx: Context) : RecyclerView(ctx) {
         val a = ev.actionMasked
         if (a == MotionEvent.ACTION_DOWN) {
             blocked = false
+            dragging = false
             downX = ev.x
             downY = ev.y
             downTime = ev.eventTime
             moved = false
             lastX = ev.x
+            dragCandidate = onDragStart(ev.x, ev.y)
         }
         if (ev.pointerCount > 1 || scaleDetector.isInProgress) {
             moved = true
+            if (dragging) {
+                dragging = false
+                onDragEnd()
+            }
+            dragCandidate = false
             if (!blocked) {
                 blocked = true
                 val c = MotionEvent.obtain(ev)
@@ -391,8 +464,28 @@ class ZoomRecycler(ctx: Context) : RecyclerView(ctx) {
             if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) blocked = false
             return true
         }
+        if (dragging) {
+            if (a == MotionEvent.ACTION_MOVE) {
+                onDragMove(ev.x, ev.y)
+            } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                dragging = false
+                dragCandidate = false
+                onDragEnd()
+            }
+            return true
+        }
         if (a == MotionEvent.ACTION_MOVE) {
             if (abs(ev.x - downX) > slop || abs(ev.y - downY) > slop) moved = true
+            if (moved && dragCandidate) {
+                // Eine Bearbeitung (Text/Signatur) wird verschoben: Liste nicht scrollen
+                dragging = true
+                val c = MotionEvent.obtain(ev)
+                c.action = MotionEvent.ACTION_CANCEL
+                super.dispatchTouchEvent(c)
+                c.recycle()
+                onDragMove(ev.x, ev.y)
+                return true
+            }
             if (moved && allowPan()) onPan(lastX - ev.x)
             lastX = ev.x
         } else if (a == MotionEvent.ACTION_UP && !moved && ev.eventTime - downTime < 350) {
@@ -409,6 +502,94 @@ class ZoomRecycler(ctx: Context) : RecyclerView(ctx) {
             }
         }
         return super.dispatchTouchEvent(ev)
+    }
+}
+
+/** Zeichenfläche für eine neue Signatur (Finger). */
+class SignaturePad(ctx: Context) : View(ctx) {
+    private val strokes = ArrayList<Path>()
+    private var cur: Path? = null
+    private var lastX = 0f
+    private var lastY = 0f
+    private val dens = ctx.resources.displayMetrics.density
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val guide = Paint()
+
+    init {
+        paint.color = Color.BLACK
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 3.5f * dens
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.strokeJoin = Paint.Join.ROUND
+        guide.color = Color.rgb(205, 205, 205)
+        guide.strokeWidth = 1f * dens
+        setBackgroundColor(Color.rgb(250, 250, 250))
+    }
+
+    fun clear() {
+        strokes.clear()
+        cur = null
+        invalidate()
+    }
+
+    override fun onTouchEvent(ev: MotionEvent): Boolean {
+        val x = ev.x
+        val y = ev.y
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                parent?.requestDisallowInterceptTouchEvent(true)
+                val p = Path()
+                p.moveTo(x, y)
+                p.lineTo(x + 0.1f, y)
+                strokes.add(p)
+                cur = p
+                lastX = x
+                lastY = y
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val p = cur ?: return true
+                p.quadTo(lastX, lastY, (x + lastX) / 2f, (y + lastY) / 2f)
+                lastX = x
+                lastY = y
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> cur = null
+        }
+        invalidate()
+        return true
+    }
+
+    override fun onDraw(c: Canvas) {
+        val gy = height * 0.72f
+        c.drawLine(16f * dens, gy, width - 16f * dens, gy, guide)
+        for (p in strokes) c.drawPath(p, paint)
+    }
+
+    /** Schwarze Tinte auf transparentem Grund, auf die Strichgrenzen zugeschnitten. */
+    fun toBitmap(): Bitmap? {
+        if (strokes.isEmpty()) return null
+        val r = RectF()
+        val tmp = RectF()
+        var first = true
+        for (p in strokes) {
+            p.computeBounds(tmp, true)
+            if (first) {
+                r.set(tmp)
+                first = false
+            } else {
+                r.union(tmp)
+            }
+        }
+        val pad = paint.strokeWidth
+        r.inset(-pad, -pad)
+        val scale = 2f
+        val w = maxOf(1, (r.width() * scale).toInt())
+        val h = maxOf(1, (r.height() * scale).toInt())
+        val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val c = Canvas(b)
+        c.scale(scale, scale)
+        c.translate(-r.left, -r.top)
+        for (p in strokes) c.drawPath(p, paint)
+        return b
     }
 }
 
@@ -454,6 +635,20 @@ class MainActivity : Activity() {
 
     private var darkMode = false
     private var statusText = ""
+    private var readingMode = false
+    private lateinit var pageInd: TextView
+    @Volatile private var viewPos = 0
+    @Volatile private var prefetchFor = -1
+    private var barTx = 0f
+    private var barTy = 0f
+    private var dragEdit: Edit? = null
+    private var dragView: PageView? = null
+    private var dragX0 = 0f
+    private var dragY0 = 0f
+    private var dragL0 = 0f
+    private var dragT0 = 0f
+    private var dragR0 = 0f
+    private var dragB0 = 0f
 
     private val cache = object : LruCache<Int, Bitmap>((Runtime.getRuntime().maxMemory() / 1024 / 6).toInt()) {
         override fun sizeOf(key: Int, value: Bitmap): Int = value.byteCount / 1024
@@ -538,6 +733,7 @@ class MainActivity : Activity() {
         PDFBoxResourceLoader.init(applicationContext)
         screenW = resources.displayMetrics.widthPixels
         darkMode = getSharedPreferences("einstellungen", MODE_PRIVATE).getBoolean("dark", false)
+        readingMode = getSharedPreferences("einstellungen", MODE_PRIVATE).getBoolean("reading", false)
         statusText = "Noch keine PDF geöffnet."
         buildUi()
         openMenu()
@@ -555,14 +751,16 @@ class MainActivity : Activity() {
 
         window.statusBarColor = bgBar()
         window.navigationBarColor = if (darkMode) Color.rgb(18, 18, 18) else Color.WHITE
-        window.decorView.systemUiVisibility =
-            if (darkMode) 0 else (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR)
+        applySystemUi()
 
         // Seitenliste
         pages = ZoomRecycler(this)
         pages.allowPan = { zoom > 1.05f }
         pages.onZoom = { f, x, y -> applyZoom(f, x, y) }
         pages.onPan = { dx -> applyPan(dx) }
+        pages.onDragStart = { x, y -> dragStart(x, y) }
+        pages.onDragMove = { x, y -> dragMove(x, y) }
+        pages.onDragEnd = { dragEnd() }
         pages.onTapAt = { x, y -> onTapAt(x, y) }
         pages.onDoubleTapAt = { x, y ->
             val target = if (zoom > 1.5f) 1f else 2.5f
@@ -577,6 +775,12 @@ class MainActivity : Activity() {
             override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
                 if (newState == RecyclerView.SCROLL_STATE_DRAGGING) hideBar()
                 if (newState == RecyclerView.SCROLL_STATE_IDLE) scheduleTiles()
+            }
+
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                val fp = lm.findFirstVisibleItemPosition()
+                if (fp >= 0) viewPos = fp
+                updatePageInd()
             }
         })
 
@@ -657,6 +861,8 @@ class MainActivity : Activity() {
         menuPanel.addView(divider())
         menuPanel.addView(menuItem(if (darkMode) "☀   Heller Modus" else "🌙   Dunkelmodus") { toggleDark() })
         menuPanel.addView(divider())
+        menuPanel.addView(menuItem(if (readingMode) "📖   Lesemodus beenden" else "📖   Lesemodus") { toggleReading() })
+        menuPanel.addView(divider())
         menuPanel.addView(menuItem("✏   Bearbeiten (Text, Formulare)") {
             closeMenu()
             setEditMode(true)
@@ -687,25 +893,60 @@ class MainActivity : Activity() {
         navBox.addView(chip("✕") { clearSearch() })
         navBox.visibility = if (matches.isEmpty() && !searchRunning) View.GONE else View.VISIBLE
 
+        // Schwebende, verschiebbare Symbolleiste für den Bearbeiten-Modus
         editBar = LinearLayout(this)
         editBar.orientation = LinearLayout.HORIZONTAL
-        editBar.gravity = Gravity.CENTER
-        editBar.setPadding(pad, pad, pad, pad)
-        editBar.setBackgroundColor(bgBar())
-        editBar.elevation = dp(6).toFloat()
-        editBar.addView(chip("☰") {
-            showBar()
-            openMenu()
-        })
-        editBar.addView(chip("↩ Rückgängig") { undoEdit() })
-        editBar.addView(chip("💾 Speichern") { saveEditsClicked() })
-        editBar.addView(chip("✕ Fertig") { setEditMode(false) })
+        editBar.gravity = Gravity.CENTER_VERTICAL
+        editBar.setPadding(dp(6), dp(2), dp(6), dp(2))
+        val gbar = GradientDrawable()
+        gbar.setColor(if (darkMode) Color.argb(245, 48, 49, 52) else Color.argb(245, 255, 255, 255))
+        gbar.cornerRadius = dp(28).toFloat()
+        gbar.setStroke(dp(1), sub())
+        editBar.background = gbar
+        editBar.elevation = dp(8).toFloat()
+        val grip = iconButton("⋮", "Leiste verschieben", 28) { }
+        var gx = 0f
+        var gy = 0f
+        grip.setOnTouchListener { _, ev ->
+            val par = editBar.parent as? View
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+                gx = ev.rawX - editBar.translationX
+                gy = ev.rawY - editBar.translationY
+            } else if (ev.actionMasked == MotionEvent.ACTION_MOVE && par != null) {
+                val minX = -editBar.left.toFloat()
+                val maxX = maxOf(minX, (par.width - editBar.right).toFloat())
+                val minY = -editBar.top.toFloat()
+                val maxY = maxOf(minY, (par.height - editBar.bottom).toFloat())
+                barTx = (ev.rawX - gx).coerceIn(minX, maxX)
+                barTy = (ev.rawY - gy).coerceIn(minY, maxY)
+                editBar.translationX = barTx
+                editBar.translationY = barTy
+            }
+            true
+        }
+        editBar.addView(grip)
+        editBar.addView(iconButton("↩", "Rückgängig") { undoEdit() })
+        editBar.addView(iconButton("✍", "Signatur einfügen") { showSignatureChooser() })
+        editBar.addView(iconButton("💾", "Speichern") { saveEditsClicked() })
+        editBar.addView(iconButton("✓", "Fertig") { setEditMode(false) })
+        editBar.translationX = barTx
+        editBar.translationY = barTy
         editBar.visibility = if (editMode) View.VISIBLE else View.GONE
+
+        // Seitenzähler (Lesemodus)
+        pageInd = TextView(this)
+        pageInd.textSize = 13f
+        pageInd.setTextColor(Color.WHITE)
+        pageInd.setPadding(dp(10), dp(5), dp(10), dp(5))
+        val gind = GradientDrawable()
+        gind.setColor(Color.argb(170, 0, 0, 0))
+        gind.cornerRadius = dp(14).toFloat()
+        pageInd.background = gind
+        pageInd.visibility = if (readingMode && pageCount > 0) View.VISIBLE else View.GONE
 
         val bottomBox = LinearLayout(this)
         bottomBox.orientation = LinearLayout.VERTICAL
         bottomBox.addView(navBox)
-        bottomBox.addView(editBar)
 
         val root = FrameLayout(this)
         root.setBackgroundColor(if (darkMode) Color.rgb(8, 8, 8) else Color.rgb(200, 200, 200))
@@ -718,6 +959,19 @@ class MainActivity : Activity() {
             bottomBox,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
         )
+        val lpBar = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        )
+        lpBar.bottomMargin = dp(28)
+        root.addView(editBar, lpBar)
+        val lpInd = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END
+        )
+        lpInd.topMargin = dp(14)
+        lpInd.rightMargin = dp(10)
+        root.addView(pageInd, lpInd)
         root.addView(
             topBox,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP)
@@ -765,6 +1019,8 @@ class MainActivity : Activity() {
         buildUi()
         if (pos > 0) lm.scrollToPosition(pos)
         openMenu()
+        viewPos = pos.coerceAtLeast(0)
+        startImagePrefetch()
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -1012,6 +1268,10 @@ class MainActivity : Activity() {
                     }
                     emptyHint.visibility = View.GONE
                     setStatus("$name – $n Seiten")
+                    viewPos = (if (rs != null) rs.pos else if (saved in 0 until n) saved else 0).coerceIn(0, n - 1)
+                    pageInd.visibility = if (readingMode) View.VISIBLE else View.GONE
+                    pageInd.text = "${viewPos + 1} / $n"
+                    startImagePrefetch()
                     hideBar()
                     filesDir.listFiles()?.forEach {
                         if (it.name.startsWith("doc_") && it != f) it.delete()
@@ -1336,7 +1596,7 @@ class MainActivity : Activity() {
     private val edits = ArrayList<Edit>()
     private val formFields = HashMap<Int, List<FormField>>()
     private val formPending = HashSet<Int>()
-    private val imgRects = HashMap<Int, List<RectF>>()
+    private val imgRects = java.util.concurrent.ConcurrentHashMap<Int, List<RectF>>()
     private val imgPending = HashSet<Int>()
     private val auxExec = Executors.newSingleThreadExecutor()
     private var auxDoc: PDDocument? = null
@@ -1351,6 +1611,7 @@ class MainActivity : Activity() {
         v.editOn = editMode
         v.fields = if (editMode) (formFields[p] ?: emptyList()) else emptyList()
         v.imgRects = if (darkMode) (imgRects[p] ?: emptyList()) else emptyList()
+        v.sepia = readingMode && !darkMode
         if (p < pageW.size) {
             v.pageWpt = pageW[p]
             v.pageHpt = pageH[p]
@@ -1387,7 +1648,7 @@ class MainActivity : Activity() {
         editBar.visibility = if (on) View.VISIBLE else View.GONE
         if (on) {
             hideBar()
-            toast("Bearbeiten: Tippe auf eine Stelle, um Text einzufügen. Blau markierte Felder sind Formularfelder. Zum Ändern oder Löschen auf den Text tippen.")
+            toast("Bearbeiten: Tippe auf eine Stelle, um Text einzufügen. Blau = leeres Formularfeld, Grün = ausgefüllt, Gelb = freier Text, Lila = Signatur. Texte und Signaturen kannst du mit dem Finger verschieben; antippen zum Ändern oder Löschen.")
         }
         refreshVisible()
     }
@@ -1488,6 +1749,8 @@ class MainActivity : Activity() {
                     refreshVisible()
                 }
             }
+        } else if (e.kind == 3) {
+            editSignature(e)
         } else {
             del()
         }
@@ -1733,6 +1996,7 @@ class MainActivity : Activity() {
     }
 
     private fun requestImages(p: Int) {
+        if (prefetchFor == loadToken) return
         if (imgRects.containsKey(p) || !imgPending.add(p)) return
         val f = currentFile
         if (f == null) {
@@ -1809,11 +2073,12 @@ class MainActivity : Activity() {
         val doc = PDDocument.load(src)
         try {
             val byPage = list.groupBy { it.page }
+            val imgCache = HashMap<String, PDImageXObject>()
             for ((p, es) in byPage) {
                 val page = doc.getPage(p)
                 val cs = PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true)
                 try {
-                    for (e in es) drawEditPdf(cs, e, page, dw[p], dh[p])
+                    for (e in es) drawEditPdf(doc, cs, e, page, dw[p], dh[p], imgCache)
                 } finally {
                     cs.close()
                 }
@@ -1833,7 +2098,10 @@ class MainActivity : Activity() {
         cs.endText()
     }
 
-    private fun drawEditPdf(cs: PDPageContentStream, e: Edit, page: PDPage, dispW: Float, dispH: Float) {
+    private fun drawEditPdf(
+        doc: PDDocument, cs: PDPageContentStream, e: Edit, page: PDPage, dispW: Float, dispH: Float,
+        imgCache: HashMap<String, PDImageXObject>
+    ) {
         val box = page.cropBox
         val rot = ((page.rotation % 360) + 360) % 360
 
@@ -1889,6 +2157,18 @@ class MainActivity : Activity() {
                 else e.top + (0.9f * size + i * 1.15f * size + 1.5f) / dispH
                 putText(cs, font, lines[i], size, user(e.left + 2f / dispW, by), rot)
             }
+        } else if (e.kind == 3) {
+            val bm = e.sig ?: return
+            val key = e.sigPath ?: ("sig@" + System.identityHashCode(bm))
+            val img: PDImageXObject = imgCache[key]
+                ?: LosslessFactory.createFromImage(doc, bm).also { imgCache[key] = it }
+            val o = user(e.left, e.bottom)
+            val xr = user(e.right, e.bottom)
+            val yt = user(e.left, e.top)
+            cs.saveGraphicsState()
+            cs.transform(com.tom_roush.pdfbox.util.Matrix(xr[0] - o[0], xr[1] - o[1], yt[0] - o[0], yt[1] - o[1], o[0], o[1]))
+            cs.drawImage(img, 0f, 0f, 1f, 1f)
+            cs.restoreGraphicsState()
         } else {
             val boxW = (e.right - e.left) * dispW
             val boxH = (e.bottom - e.top) * dispH
@@ -1900,9 +2180,445 @@ class MainActivity : Activity() {
         }
     }
 
+    // ------------------------------------------------------------ Symbolleiste, Lesemodus, Bilder-Vorlauf, Signaturen
+
+    private fun iconButton(sym: String, desc: String, w: Int = 44, action: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = sym
+        t.textSize = 22f
+        t.setTextColor(fg())
+        t.gravity = Gravity.CENTER
+        t.contentDescription = desc
+        t.layoutParams = LinearLayout.LayoutParams(dp(w), dp(44))
+        t.setOnClickListener { action() }
+        return t
+    }
+
+    // ---- Verschieben von Texten und Signaturen
+
+    private fun dragStart(x: Float, y: Float): Boolean {
+        dragEdit = null
+        if (!editMode || topBox.visibility == View.VISIBLE) return false
+        val v = pages.findChildViewUnder(x, y) as? PageView ?: return false
+        val p = v.tag as? Int ?: return false
+        if (v.height <= 0) return false
+        val fx = (x - v.left + panX) / (screenW * zoom)
+        val fy = (y - v.top) / v.height.toFloat()
+        for (e in edits.asReversed()) {
+            if (e.page == p && (e.kind == 0 || e.kind == 3) && hitEdit(e, fx, fy)) {
+                dragEdit = e
+                dragView = v
+                dragX0 = x
+                dragY0 = y
+                dragL0 = e.left
+                dragT0 = e.top
+                dragR0 = e.right
+                dragB0 = e.bottom
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun dragMove(x: Float, y: Float) {
+        val e = dragEdit ?: return
+        val v = dragView ?: return
+        if (v.height <= 0) return
+        val dx = (x - dragX0) / (screenW * zoom)
+        val dy = (y - dragY0) / v.height.toFloat()
+        if (e.kind == 0) {
+            e.left = (dragL0 + dx).coerceIn(0f, 0.97f)
+            e.top = (dragT0 + dy).coerceIn(0f, 0.97f)
+        } else {
+            val w = dragR0 - dragL0
+            val h = dragB0 - dragT0
+            e.left = (dragL0 + dx).coerceIn(0f, maxOf(0f, 1f - w))
+            e.top = (dragT0 + dy).coerceIn(0f, maxOf(0f, 1f - h))
+            e.right = e.left + w
+            e.bottom = e.top + h
+        }
+        v.invalidate()
+    }
+
+    private fun dragEnd() {
+        dragEdit = null
+        dragView = null
+    }
+
+    // ---- Lesemodus
+
+    private fun applySystemUi() {
+        var f = if (darkMode) 0 else (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR)
+        if (readingMode) {
+            f = f or View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        window.decorView.systemUiVisibility = f
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && readingMode) applySystemUi()
+    }
+
+    private fun toggleReading() {
+        readingMode = !readingMode
+        getSharedPreferences("einstellungen", MODE_PRIVATE).edit().putBoolean("reading", readingMode).apply()
+        applySystemUi()
+        pageInd.visibility = if (readingMode && pageCount > 0) View.VISIBLE else View.GONE
+        updatePageInd()
+        refreshVisible()
+        closeMenu()
+        hideBar()
+        if (readingMode) {
+            toast("Lesemodus an: Vollbild, Bildschirm bleibt an, warmer Papierton (im hellen Modus). Tippe auf die Seite, um die Leiste zu holen.")
+        }
+    }
+
+    private fun updatePageInd() {
+        if (!this::pageInd.isInitialized || pageCount == 0) return
+        var p = -1
+        val c = pages.findChildViewUnder(pages.width / 2f, pages.height / 2f)
+        if (c != null) p = pages.getChildAdapterPosition(c)
+        if (p < 0) p = lm.findFirstVisibleItemPosition()
+        if (p < 0) return
+        pageInd.text = "${p + 1} / $pageCount"
+    }
+
+    // ---- Bilder im Dunkelmodus: alle Seiten im Hintergrund vorab auswerten (sichtbare Seite zuerst)
+
+    private fun nextUndetected(seen: HashSet<Int>): Int {
+        val n = pageCount
+        if (n == 0) return -1
+        val c = viewPos.coerceIn(0, n - 1)
+        for (d in 0 until n) {
+            val a = c + d
+            if (a < n && !imgRects.containsKey(a) && !seen.contains(a)) return a
+            val b = c - d
+            if (d > 0 && b >= 0 && !imgRects.containsKey(b) && !seen.contains(b)) return b
+        }
+        return -1
+    }
+
+    private fun startImagePrefetch() {
+        if (!darkMode || pageCount == 0) return
+        val f = currentFile ?: return
+        val token = loadToken
+        if (prefetchFor == token) return
+        prefetchFor = token
+        auxExec.execute {
+            var fails = 0
+            val seen = HashSet<Int>()
+            try {
+                while (token == loadToken && darkMode && fails < 3) {
+                    val p = nextUndetected(seen)
+                    if (p < 0) break
+                    seen.add(p)
+                    var res: List<RectF> = emptyList()
+                    try {
+                        res = detectImages(f, p)
+                    } catch (e: Throwable) {
+                        fails++
+                    }
+                    if (token != loadToken) break
+                    main.post {
+                        if (token == loadToken) {
+                            imgRects[p] = res
+                            refreshPage(p)
+                        }
+                    }
+                }
+            } finally {
+                if (prefetchFor == token) prefetchFor = -1
+            }
+        }
+    }
+
+    // ---- Signaturen
+
+    private fun sigDir(): File {
+        val d = File(filesDir, "signatures")
+        d.mkdirs()
+        return d
+    }
+
+    private fun sigFiles(): List<File> {
+        val l = sigDir().listFiles { f -> f.name.endsWith(".png") } ?: return emptyList()
+        return l.sortedByDescending { it.lastModified() }
+    }
+
+    private fun saveSignature(b: Bitmap) {
+        val f = File(sigDir(), "sig_" + System.currentTimeMillis() + ".png")
+        f.outputStream().use { b.compress(Bitmap.CompressFormat.PNG, 100, it) }
+    }
+
+    private fun showSignatureChooser() {
+        if (pageCount == 0) {
+            toast("Bitte zuerst eine PDF öffnen.")
+            return
+        }
+        val files = sigFiles()
+        val scroll = ScrollView(this)
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(16), dp(8), dp(16), dp(8))
+        scroll.addView(box)
+        val info = TextView(this)
+        info.text = if (files.isEmpty()) "Noch keine Signatur gespeichert. Zeichne eine neue oder nimm ein Foto deiner Unterschrift (dunkler Stift auf weißem Papier)."
+        else "Antippen = einfügen · Lange drücken = löschen"
+        info.textSize = 13f
+        box.addView(info)
+        var dlg: AlertDialog? = null
+        for (f in files) {
+            val bmp = BitmapFactory.decodeFile(f.absolutePath) ?: continue
+            val iv = ImageView(this)
+            iv.setImageBitmap(bmp)
+            iv.scaleType = ImageView.ScaleType.FIT_CENTER
+            val g = GradientDrawable()
+            g.setColor(Color.WHITE)
+            g.setStroke(dp(1), Color.rgb(190, 190, 190))
+            g.cornerRadius = dp(8).toFloat()
+            iv.background = g
+            iv.setPadding(dp(8), dp(8), dp(8), dp(8))
+            val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(90))
+            lp.topMargin = dp(10)
+            iv.layoutParams = lp
+            iv.setOnClickListener {
+                dlg?.dismiss()
+                placeSignature(f)
+            }
+            iv.setOnLongClickListener {
+                AlertDialog.Builder(this)
+                    .setTitle("Signatur löschen?")
+                    .setPositiveButton("Löschen") { _, _ ->
+                        f.delete()
+                        dlg?.dismiss()
+                        showSignatureChooser()
+                    }
+                    .setNegativeButton("Abbrechen", null)
+                    .show()
+                true
+            }
+            box.addView(iv)
+        }
+        dlg = AlertDialog.Builder(this)
+            .setTitle("Signatur wählen")
+            .setView(scroll)
+            .setPositiveButton("Neu zeichnen") { _, _ -> showSignaturePad() }
+            .setNeutralButton("Aus Foto") { _, _ -> pick("image/*", REQ_SIGIMG) }
+            .setNegativeButton("Abbrechen", null)
+            .show()
+    }
+
+    private fun showSignaturePad() {
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(20), dp(8), dp(20), 0)
+        val hint = TextView(this)
+        hint.text = "Unterschreibe mit dem Finger in der Fläche."
+        hint.textSize = 13f
+        box.addView(hint)
+        val pad = SignaturePad(this)
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(230))
+        lp.topMargin = dp(8)
+        box.addView(pad, lp)
+        val d = AlertDialog.Builder(this)
+            .setTitle("Neue Signatur")
+            .setView(box)
+            .setPositiveButton("Speichern", null)
+            .setNeutralButton("Neu beginnen", null)
+            .setNegativeButton("Abbrechen", null)
+            .create()
+        d.show()
+        d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val b = pad.toBitmap()
+            if (b == null) {
+                toast("Bitte zuerst unterschreiben.", false)
+            } else {
+                saveSignature(b)
+                d.dismiss()
+                toast("Signatur gespeichert.", false)
+                showSignatureChooser()
+            }
+        }
+        d.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener { pad.clear() }
+    }
+
+    /** Foto einer Unterschrift: Papier wird transparent, die Tinte schwarz. */
+    private fun signatureFromPhoto(src: Bitmap): Bitmap? {
+        var bm = src
+        val maxSide = 1400
+        val big = maxOf(bm.width, bm.height)
+        if (big > maxSide) {
+            val s = maxSide.toFloat() / big
+            bm = Bitmap.createScaledBitmap(bm, maxOf(1, (bm.width * s).toInt()), maxOf(1, (bm.height * s).toInt()), true)
+        }
+        val w = bm.width
+        val h = bm.height
+        val px = IntArray(w * h)
+        bm.getPixels(px, 0, w, 0, 0, w, h)
+        val lum = IntArray(w * h)
+        val hist = IntArray(256)
+        for (i in px.indices) {
+            val c = px[i]
+            val l = (0.299f * Color.red(c) + 0.587f * Color.green(c) + 0.114f * Color.blue(c)).toInt().coerceIn(0, 255)
+            lum[i] = l
+            hist[l]++
+        }
+        var acc = 0
+        var paperL = 255
+        val target = (w * h * 0.8f).toInt()
+        for (i in 0..255) {
+            acc += hist[i]
+            if (acc >= target) {
+                paperL = i
+                break
+            }
+        }
+        val hi = paperL * 0.88f
+        val lo = paperL * 0.55f
+        if (hi - lo < 8f) return null
+        val alpha = IntArray(w * h)
+        var minX = w
+        var minY = h
+        var maxX = -1
+        var maxY = -1
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val i = y * w + x
+                val a = ((hi - lum[i]) / (hi - lo) * 255f).toInt().coerceIn(0, 255)
+                alpha[i] = a
+                if (a > 60) {
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+        }
+        if (maxX < 0) return null
+        val pad = 6
+        minX = maxOf(0, minX - pad)
+        minY = maxOf(0, minY - pad)
+        maxX = minOf(w - 1, maxX + pad)
+        maxY = minOf(h - 1, maxY + pad)
+        val cw = maxX - minX + 1
+        val ch = maxY - minY + 1
+        if (cw < 20 || ch < 8) return null
+        val out = IntArray(cw * ch)
+        var ink = 0
+        for (y in 0 until ch) {
+            for (x in 0 until cw) {
+                val a = alpha[(y + minY) * w + (x + minX)]
+                out[y * cw + x] = a shl 24
+                if (a > 60) ink++
+            }
+        }
+        if (ink < 30) return null
+        return Bitmap.createBitmap(out, cw, ch, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun importSignatureImage(u: Uri) {
+        toast("Verarbeite Foto …", false)
+        ioExec.execute {
+            var result: Bitmap? = null
+            try {
+                val src = loadBitmap(u)
+                if (src != null) result = signatureFromPhoto(src)
+            } catch (e: Throwable) {
+            }
+            main.post {
+                val b = result
+                if (b == null) {
+                    toast("Keine Unterschrift erkannt. Fotografiere sie mit dunklem Stift auf weißem Papier bei guter Beleuchtung.")
+                } else {
+                    saveSignature(b)
+                    toast("Signatur gespeichert.", false)
+                    showSignatureChooser()
+                }
+            }
+        }
+    }
+
+    /** Fügt die gewählte Signatur in der Mitte der sichtbaren Seite ein; danach mit dem Finger verschiebbar. */
+    private fun placeSignature(f: File) {
+        val bmp = BitmapFactory.decodeFile(f.absolutePath)
+        if (bmp == null) {
+            toast("Signatur konnte nicht geladen werden.")
+            return
+        }
+        var best: PageView? = null
+        var bestVis = 0
+        for (i in 0 until pages.childCount) {
+            val v = pages.getChildAt(i) as? PageView ?: continue
+            val vis = Rect()
+            if (!v.getLocalVisibleRect(vis)) continue
+            if (vis.height() > bestVis) {
+                bestVis = vis.height()
+                best = v
+            }
+        }
+        val v = best ?: return
+        val p = v.tag as? Int ?: return
+        if (v.height <= 0 || p >= pageW.size) return
+        val vis = Rect()
+        v.getLocalVisibleRect(vis)
+        val wFrac = 0.30f
+        val hFrac = (wFrac * bmp.height / bmp.width * pageW[p] / pageH[p]).coerceAtMost(0.5f)
+        val cx = (panX + screenW / 2f) / (screenW * zoom)
+        val cy = (vis.top + vis.bottom) / 2f / v.height.toFloat()
+        val left = (cx - wFrac / 2f).coerceIn(0f, 1f - wFrac)
+        val top = (cy - hFrac / 2f).coerceIn(0f, 1f - hFrac)
+        val e = Edit(p, left, top, left + wFrac, top + hFrac, "", 0f, 3, null, null)
+        e.sig = bmp
+        e.sigPath = f.absolutePath
+        edits.add(e)
+        refreshVisible()
+        toast("Signatur eingefügt: mit dem Finger verschieben, antippen für Größe oder Löschen.")
+    }
+
+    private fun scaleSignature(e: Edit, factor: Float) {
+        val ow = e.right - e.left
+        val oh = e.bottom - e.top
+        if (ow <= 0f) return
+        val cx = (e.left + e.right) / 2f
+        val cy = (e.top + e.bottom) / 2f
+        val w = (ow * factor).coerceIn(0.05f, 0.9f)
+        val h = (oh * (w / ow)).coerceAtMost(0.9f)
+        e.left = (cx - w / 2f).coerceIn(0f, maxOf(0f, 1f - w))
+        e.top = (cy - h / 2f).coerceIn(0f, maxOf(0f, 1f - h))
+        e.right = e.left + w
+        e.bottom = e.top + h
+        refreshVisible()
+    }
+
+    private fun editSignature(e: Edit) {
+        val d = AlertDialog.Builder(this)
+            .setTitle("Signatur")
+            .setMessage("Mit dem Finger auf der Seite verschieben. Hier die Größe ändern:")
+            .setPositiveButton("Größer", null)
+            .setNegativeButton("Kleiner", null)
+            .setNeutralButton("Löschen") { _, _ ->
+                edits.remove(e)
+                refreshVisible()
+            }
+            .create()
+        d.show()
+        d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener { scaleSignature(e, 1.2f) }
+        d.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener { scaleSignature(e, 1f / 1.2f) }
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         screenW = resources.displayMetrics.widthPixels
+        barTx = 0f
+        barTy = 0f
+        if (this::editBar.isInitialized) {
+            editBar.translationX = 0f
+            editBar.translationY = 0f
+        }
         cache.evictAll()
         clampPan()
         if (pageCount > 0) {
@@ -2024,7 +2740,7 @@ class MainActivity : Activity() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
         i.addCategory(Intent.CATEGORY_OPENABLE)
         i.type = mime
-        if (req != REQ_OPEN) i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        if (req == REQ_MERGE || req == REQ_IMAGES) i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         startActivityForResult(i, req)
     }
 
@@ -2070,6 +2786,7 @@ class MainActivity : Activity() {
                 }
             }
             REQ_SAVE -> data.data?.let { writeResult(it) }
+            REQ_SIGIMG -> data.data?.let { importSignatureImage(it) }
         }
     }
 
