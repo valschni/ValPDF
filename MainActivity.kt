@@ -593,6 +593,89 @@ class SignaturePad(ctx: Context) : View(ctx) {
     }
 }
 
+/** Schnellscroll-Leiste am rechten Rand: Griff ziehen springt durch die PDF und zeigt die Seitenzahl. */
+class FastScroller(ctx: Context) : View(ctx) {
+    var fraction = 0f
+    var page = 1
+    var pageCount = 1
+    var dragging = false
+    var onDrag: (Float) -> Unit = {}
+    var onDragState: (Boolean) -> Unit = {}
+
+    private val dens = ctx.resources.displayMetrics.density
+    private val thumbW = 46f * dens
+    private val thumbH = 40f * dens
+    private val topPad = 60f * dens
+    private val botPad = 36f * dens
+    private var grab = 0f
+    private val bg = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val txt = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val rr = RectF()
+
+    init {
+        bg.color = Color.argb(225, 45, 49, 56)
+        txt.color = Color.WHITE
+        txt.textAlign = Paint.Align.CENTER
+        txt.typeface = Typeface.DEFAULT_BOLD
+    }
+
+    private fun span(): Float = maxOf(1f, height - topPad - botPad - thumbH)
+    private fun thumbTop(): Float = topPad + fraction.coerceIn(0f, 1f) * span()
+
+    override fun onDraw(c: Canvas) {
+        val l = width - thumbW - 4f * dens
+        val t = thumbTop()
+        rr.set(l, t, l + thumbW, t + thumbH)
+        c.drawRoundRect(rr, thumbH / 2f, thumbH / 2f, bg)
+        txt.textSize = 14f * dens
+        c.drawText(page.toString(), rr.centerX(), rr.centerY() + txt.textSize * 0.35f, txt)
+        if (dragging) {
+            val label = "Seite $page / $pageCount"
+            txt.textSize = 18f * dens
+            val w = txt.measureText(label) + 28f * dens
+            val h = 44f * dens
+            val bl = l - w - 10f * dens
+            val bt = t + thumbH / 2f - h / 2f
+            rr.set(bl, bt, bl + w, bt + h)
+            c.drawRoundRect(rr, 12f * dens, 12f * dens, bg)
+            c.drawText(label, rr.centerX(), rr.centerY() + txt.textSize * 0.35f, txt)
+        }
+    }
+
+    override fun onTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val tt = thumbTop()
+                val left = width - thumbW - 12f * dens
+                if (ev.x >= left && ev.y >= tt - 12f * dens && ev.y <= tt + thumbH + 12f * dens) {
+                    dragging = true
+                    grab = ev.y - tt
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    onDragState(true)
+                    invalidate()
+                    return true
+                }
+                return false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!dragging) return false
+                fraction = ((ev.y - grab - topPad) / span()).coerceIn(0f, 1f)
+                onDrag(fraction)
+                invalidate()
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (!dragging) return false
+                dragging = false
+                onDragState(false)
+                invalidate()
+                return true
+            }
+        }
+        return dragging
+    }
+}
+
 class VH(val v: PageView) : RecyclerView.ViewHolder(v)
 
 class MainActivity : Activity() {
@@ -637,6 +720,8 @@ class MainActivity : Activity() {
     private var statusText = ""
     private var readingMode = false
     private lateinit var pageInd: TextView
+    private lateinit var fast: FastScroller
+    private val fastHide = Runnable { if (this::fast.isInitialized && !fast.dragging) fast.visibility = View.GONE }
     @Volatile private var viewPos = 0
     @Volatile private var prefetchFor = -1
     private var barTx = 0f
@@ -781,6 +866,8 @@ class MainActivity : Activity() {
                 val fp = lm.findFirstVisibleItemPosition()
                 if (fp >= 0) viewPos = fp
                 updatePageInd()
+                updateFast()
+                if (dy != 0) showFast()
             }
         })
 
@@ -972,6 +1059,19 @@ class MainActivity : Activity() {
         lpInd.topMargin = dp(14)
         lpInd.rightMargin = dp(10)
         root.addView(pageInd, lpInd)
+        fast = FastScroller(this)
+        fast.visibility = View.GONE
+        fast.onDrag = { f -> seekTo(f) }
+        fast.onDragState = { d ->
+            if (d) {
+                hideBar()
+                main.removeCallbacks(fastHide)
+            } else {
+                main.postDelayed(fastHide, 1500)
+                scheduleTiles()
+            }
+        }
+        root.addView(fast, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         root.addView(
             topBox,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP)
@@ -2243,6 +2343,66 @@ class MainActivity : Activity() {
     private fun dragEnd() {
         dragEdit = null
         dragView = null
+    }
+
+    // ---- Schnellscroll-Leiste
+
+    private fun totalHeight(): Long {
+        var t = 0L
+        for (i in 0 until pageCount) t += pageHeightPx(i) + 6
+        return t
+    }
+
+    private fun scrollOffset(): Long {
+        val first = lm.findFirstVisibleItemPosition()
+        if (first < 0) return 0L
+        var t = 0L
+        for (i in 0 until first) t += pageHeightPx(i) + 6
+        val c = lm.findViewByPosition(first)
+        return t + (if (c != null) -c.top else 0)
+    }
+
+    /** Seite, die an der Gesamt-Position (in Pixeln) liegt. */
+    private fun pageAt(offset: Long): Int {
+        var acc = 0L
+        var pos = 0
+        while (pos < pageCount - 1 && acc + pageHeightPx(pos) + 6 <= offset) {
+            acc += pageHeightPx(pos) + 6
+            pos++
+        }
+        return pos
+    }
+
+    private fun seekTo(f: Float) {
+        if (pageCount == 0) return
+        val range = totalHeight() - pages.height
+        if (range <= 0) return
+        val target = (f.coerceIn(0f, 1f) * range).toLong()
+        val pos = pageAt(target)
+        var acc = 0L
+        for (i in 0 until pos) acc += pageHeightPx(i) + 6
+        lm.scrollToPositionWithOffset(pos, -(target - acc).toInt())
+        fast.page = pageAt(target + pages.height / 2) + 1
+        fast.pageCount = pageCount
+        fast.invalidate()
+    }
+
+    private fun updateFast() {
+        if (!this::fast.isInitialized || pageCount < 2 || fast.dragging) return
+        val range = totalHeight() - pages.height
+        if (range <= 0) return
+        fast.fraction = scrollOffset().coerceIn(0L, range).toFloat() / range
+        fast.page = pageAt(scrollOffset() + pages.height / 2) + 1
+        fast.pageCount = pageCount
+        fast.invalidate()
+    }
+
+    private fun showFast() {
+        if (!this::fast.isInitialized || pageCount < 2) return
+        if (totalHeight() <= pages.height) return
+        fast.visibility = View.VISIBLE
+        main.removeCallbacks(fastHide)
+        main.postDelayed(fastHide, 1500)
     }
 
     // ---- Lesemodus
