@@ -30,6 +30,13 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import android.text.InputType
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.format.DateUtils
+import android.text.style.LeadingMarginSpan
+import android.text.style.RelativeSizeSpan
+import android.text.style.StyleSpan
+import android.util.TypedValue
 import android.util.LruCache
 import android.view.Gravity
 import android.view.MotionEvent
@@ -43,6 +50,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -676,6 +684,15 @@ class FastScroller(ctx: Context) : View(ctx) {
     }
 }
 
+/** Ein Absatz im Lesemodus. kind: 0 Text, 1 Überschrift, 2 Aufzählung. */
+class RPara(var text: String, var kind: Int, val marker: String = "") {
+    var lines = 1
+}
+
+private val bulletRe = Regex("^(\\d{1,2}[.)]|[•·▪●◦‣*–—-])\\s+")
+
+class RVH(val tv: TextView) : RecyclerView.ViewHolder(tv)
+
 class VH(val v: PageView) : RecyclerView.ViewHolder(v)
 
 class MainActivity : Activity() {
@@ -721,6 +738,26 @@ class MainActivity : Activity() {
     private var readingMode = false
     private lateinit var pageInd: TextView
     private lateinit var fast: FastScroller
+    @Volatile private var readerOpen = false
+    private var readerBox: FrameLayout? = null
+    private lateinit var rdList: RecyclerView
+    private lateinit var rdLm: LinearLayoutManager
+    private lateinit var rdAdapter: ReaderAdapter
+    private var rdTop: View? = null
+    private var rdBottom: View? = null
+    private var rdPanel: View? = null
+    private var rdSeek: SeekBar? = null
+    private var rdPill: TextView? = null
+    private var rdSize = 20
+    private var rdTheme = 0
+    private var rdSerif = true
+    private var rdSeeking = false
+    @Volatile private var rdPos = 0
+    private var rdWorker = false
+    private val rdWanted: MutableSet<Int> = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+    private val rdCache = LruCache<Int, CharSequence>(400)
+    private var backCb: Any? = null
+    private var currentUriStr: String? = null
     private val fastHide = Runnable { if (this::fast.isInitialized && !fast.dragging) fast.visibility = View.GONE }
     @Volatile private var viewPos = 0
     @Volatile private var prefetchFor = -1
@@ -818,7 +855,7 @@ class MainActivity : Activity() {
         PDFBoxResourceLoader.init(applicationContext)
         screenW = resources.displayMetrics.widthPixels
         darkMode = getSharedPreferences("einstellungen", MODE_PRIVATE).getBoolean("dark", false)
-        readingMode = getSharedPreferences("einstellungen", MODE_PRIVATE).getBoolean("reading", false)
+        readingMode = false
         statusText = "Noch keine PDF geöffnet."
         buildUi()
         openMenu()
@@ -936,6 +973,11 @@ class MainActivity : Activity() {
             confirmDiscard { pick("application/pdf", REQ_OPEN) }
         })
         menuPanel.addView(divider())
+        menuPanel.addView(menuItem("🕘   Zuletzt geöffnet") {
+            closeMenu()
+            showRecents()
+        })
+        menuPanel.addView(divider())
         menuPanel.addView(menuItem("➕   PDFs zusammenfügen") {
             closeMenu()
             confirmDiscard { pick("application/pdf", REQ_MERGE) }
@@ -948,7 +990,10 @@ class MainActivity : Activity() {
         menuPanel.addView(divider())
         menuPanel.addView(menuItem(if (darkMode) "☀   Heller Modus" else "🌙   Dunkelmodus") { toggleDark() })
         menuPanel.addView(divider())
-        menuPanel.addView(menuItem(if (readingMode) "📖   Lesemodus beenden" else "📖   Lesemodus") { toggleReading() })
+        menuPanel.addView(menuItem("📖   Lesemodus (Text umbrechen)") {
+            closeMenu()
+            openReader()
+        })
         menuPanel.addView(divider())
         menuPanel.addView(menuItem("✏   Bearbeiten (Text, Formulare)") {
             closeMenu()
@@ -1163,13 +1208,20 @@ class MainActivity : Activity() {
         e.putString("lastQuery", searchBox.text.toString())
         e.putInt(docKey(currentName, f.length()), first)
         e.apply()
+        updateRecentPage(first)
     }
 
     private fun docKey(name: String, size: Long): String = "p_" + (name + "|" + size).hashCode()
 
     private fun handleIntent(i: Intent?) {
         val u = i?.data
-        if (i != null && i.action == Intent.ACTION_VIEW && u != null) openPdf(u)
+        if (i != null && i.action == Intent.ACTION_VIEW && u != null) {
+            try {
+                contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (e: Exception) {
+            }
+            openPdf(u)
+        }
     }
 
     // ------------------------------------------------------------ Seitenanzeige
@@ -1258,6 +1310,9 @@ class MainActivity : Activity() {
     private fun beginLoad(msg: String) {
         loadToken++
         searchToken++
+        if (readerOpen) closeReader(false)
+        rdCache.evictAll()
+        rdWanted.clear()
         searchRunning = false
         setStatus(msg)
         matches = emptyList()
@@ -1288,6 +1343,8 @@ class MainActivity : Activity() {
     /** Kopiert die gewählte PDF in den App-Speicher (damit sie dauerhaft verfügbar bleibt) und öffnet sie. */
     private fun openPdf(uri: Uri, keep: Restore? = null) {
         val name = nameOf(uri)
+        currentUriStr = uri.toString()
+        if (keep == null) addRecent(uri, name)
         val target = nextDocFile()
         beginLoad("Öffne PDF …")
         val token = loadToken
@@ -2345,6 +2402,638 @@ class MainActivity : Activity() {
         dragView = null
     }
 
+    // ------------------------------------------------------------ Lesemodus (Text neu umbrochen)
+
+    private fun rdBg(): Int = when (rdTheme) {
+        0 -> Color.rgb(44, 46, 58)
+        1 -> Color.rgb(247, 236, 212)
+        else -> Color.WHITE
+    }
+
+    private fun rdFg(): Int = when (rdTheme) {
+        0 -> Color.rgb(236, 236, 240)
+        1 -> Color.rgb(58, 46, 34)
+        else -> Color.rgb(28, 28, 28)
+    }
+
+    private fun rdBar(): Int = when (rdTheme) {
+        0 -> Color.rgb(14, 14, 14)
+        1 -> Color.rgb(236, 222, 192)
+        else -> Color.rgb(245, 245, 245)
+    }
+
+    private fun rdBarFg(): Int = when (rdTheme) {
+        0 -> Color.WHITE
+        1 -> Color.rgb(58, 46, 34)
+        else -> Color.BLACK
+    }
+
+    private fun rdAccent(): Int = Color.rgb(66, 165, 245)
+
+    private fun saveReaderPrefs() {
+        getSharedPreferences("einstellungen", MODE_PRIVATE).edit()
+            .putInt("rd_size", rdSize)
+            .putInt("rd_theme", rdTheme)
+            .putBoolean("rd_serif", rdSerif)
+            .apply()
+    }
+
+    private fun openReader() {
+        if (pageCount == 0) {
+            toast("Bitte zuerst eine PDF öffnen.")
+            return
+        }
+        if (readerOpen) return
+        val p = getSharedPreferences("einstellungen", MODE_PRIVATE)
+        rdSize = p.getInt("rd_size", 20).coerceIn(12, 36)
+        rdTheme = p.getInt("rd_theme", 0).coerceIn(0, 2)
+        rdSerif = p.getBoolean("rd_serif", true)
+        var start = lm.findFirstVisibleItemPosition()
+        val c = pages.findChildViewUnder(pages.width / 2f, pages.height / 2f)
+        if (c != null) start = pages.getChildAdapterPosition(c)
+        start = start.coerceIn(0, pageCount - 1)
+        readerOpen = true
+        hideBar()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        buildReader(start, false)
+        registerReaderBack()
+    }
+
+    private fun closeReader(scroll: Boolean = true) {
+        if (!readerOpen) return
+        val pos = rdCurrent()
+        readerOpen = false
+        readerBox?.let { (it.parent as? ViewGroup)?.removeView(it) }
+        readerBox = null
+        rdTop = null
+        rdBottom = null
+        rdPanel = null
+        rdSeek = null
+        rdPill = null
+        rdWanted.clear()
+        unregisterReaderBack()
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.statusBarColor = bgBar()
+        window.navigationBarColor = if (darkMode) Color.rgb(18, 18, 18) else Color.WHITE
+        applySystemUi()
+        if (scroll && pageCount > 0) {
+            val q = pos.coerceIn(0, pageCount - 1)
+            lm.scrollToPositionWithOffset(q, 0)
+            viewPos = q
+        }
+        startImagePrefetch()
+        hideBar()
+    }
+
+    private fun applyReaderSystemUi() {
+        window.statusBarColor = rdBar()
+        window.navigationBarColor = rdBar()
+        window.decorView.systemUiVisibility =
+            if (rdTheme == 0) 0 else (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR)
+    }
+
+    private fun registerReaderBack() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            val cb = android.window.OnBackInvokedCallback { onReaderBack() }
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb)
+            backCb = cb
+        }
+    }
+
+    private fun unregisterReaderBack() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            val cb = backCb as? android.window.OnBackInvokedCallback ?: return
+            onBackInvokedDispatcher.unregisterOnBackInvokedCallback(cb)
+            backCb = null
+        }
+    }
+
+    private fun onReaderBack() {
+        val pn = rdPanel
+        if (pn != null && pn.visibility == View.VISIBLE) pn.visibility = View.GONE else closeReader()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (readerOpen) onReaderBack() else super.onBackPressed()
+    }
+
+    private fun rdIcon(sym: String, desc: String, action: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = sym
+        t.textSize = 20f
+        t.setTextColor(rdBarFg())
+        t.gravity = Gravity.CENTER
+        t.contentDescription = desc
+        t.layoutParams = LinearLayout.LayoutParams(dp(52), dp(52))
+        t.setOnClickListener { action() }
+        return t
+    }
+
+    private fun rdChip(label: String, selected: Boolean, action: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = label
+        t.textSize = 15f
+        t.gravity = Gravity.CENTER
+        t.setTextColor(if (selected) Color.WHITE else rdBarFg())
+        t.setPadding(dp(14), dp(8), dp(14), dp(8))
+        val g = GradientDrawable()
+        g.cornerRadius = dp(18).toFloat()
+        if (selected) {
+            g.setColor(rdAccent())
+        } else {
+            g.setColor(Color.TRANSPARENT)
+            g.setStroke(dp(1), rdBarFg())
+        }
+        t.background = g
+        t.setOnClickListener { action() }
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+        t.layoutParams = lp
+        return t
+    }
+
+    private fun tintSeek(s: SeekBar) {
+        val cs = android.content.res.ColorStateList.valueOf(rdAccent())
+        s.progressTintList = cs
+        s.thumbTintList = cs
+    }
+
+    private fun buildReader(start: Int, panelOpen: Boolean) {
+        val content = findViewById<ViewGroup>(android.R.id.content)
+        readerBox?.let { content.removeView(it) }
+        val box = FrameLayout(this)
+        box.setBackgroundColor(rdBg())
+        box.isClickable = true
+        readerBox = box
+        applyReaderSystemUi()
+
+        rdLm = LinearLayoutManager(this)
+        rdList = RecyclerView(this)
+        rdList.layoutManager = rdLm
+        rdAdapter = ReaderAdapter()
+        rdList.adapter = rdAdapter
+        rdList.itemAnimator = null
+        rdList.clipToPadding = false
+        rdList.setPadding(0, dp(12), 0, dp(12))
+        rdList.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                if (newState == RecyclerView.SCROLL_STATE_DRAGGING) setReaderBars(false)
+            }
+
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                rdSync()
+            }
+        })
+        box.addView(rdList, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        // Obere Leiste
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        top.gravity = Gravity.CENTER_VERTICAL
+        top.setBackgroundColor(rdBar())
+        top.setPadding(dp(4), 0, dp(4), 0)
+        top.addView(rdIcon("✕", "Lesemodus beenden") { closeReader() })
+        val title = TextView(this)
+        title.text = currentName
+        title.textSize = 16f
+        title.setTextColor(rdBarFg())
+        title.maxLines = 1
+        title.ellipsize = android.text.TextUtils.TruncateAt.END
+        title.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        top.addView(title)
+        top.addView(rdIcon("Aa", "Darstellung") {
+            val pn = rdPanel
+            if (pn != null) pn.visibility = if (pn.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        })
+        box.addView(top, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52), Gravity.TOP))
+        rdTop = top
+
+        // Einstellungen: Schriftgröße, Farbe, Schriftart
+        val panel = LinearLayout(this)
+        panel.orientation = LinearLayout.VERTICAL
+        panel.setBackgroundColor(rdBar())
+        panel.setPadding(dp(16), dp(8), dp(16), dp(14))
+        val sizeRow = LinearLayout(this)
+        sizeRow.orientation = LinearLayout.HORIZONTAL
+        sizeRow.gravity = Gravity.CENTER_VERTICAL
+        val aS = TextView(this)
+        aS.text = "A"
+        aS.textSize = 14f
+        aS.setTextColor(rdBarFg())
+        sizeRow.addView(aS)
+        val sz = SeekBar(this)
+        sz.max = 24
+        sz.progress = rdSize - 12
+        tintSeek(sz)
+        sz.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                rdSize = 12 + p
+                saveReaderPrefs()
+                rdAdapter.notifyDataSetChanged()
+            }
+
+            override fun onStartTrackingTouch(s: SeekBar) {}
+            override fun onStopTrackingTouch(s: SeekBar) {}
+        })
+        sizeRow.addView(sz, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val aL = TextView(this)
+        aL.text = "A"
+        aL.textSize = 28f
+        aL.setTextColor(rdBarFg())
+        sizeRow.addView(aL)
+        panel.addView(sizeRow)
+        val themeRow = LinearLayout(this)
+        themeRow.orientation = LinearLayout.HORIZONTAL
+        themeRow.gravity = Gravity.CENTER
+        val names = arrayOf("Dunkel", "Sepia", "Hell")
+        for (i in 0..2) {
+            themeRow.addView(rdChip(names[i], rdTheme == i) {
+                rdTheme = i
+                saveReaderPrefs()
+                buildReader(rdCurrent(), true)
+            })
+        }
+        themeRow.addView(rdChip("Serif", rdSerif) {
+            rdSerif = true
+            saveReaderPrefs()
+            buildReader(rdCurrent(), true)
+        })
+        themeRow.addView(rdChip("Sans", !rdSerif) {
+            rdSerif = false
+            saveReaderPrefs()
+            buildReader(rdCurrent(), true)
+        })
+        panel.addView(themeRow)
+        panel.visibility = if (panelOpen) View.VISIBLE else View.GONE
+        val lpPanel = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP)
+        lpPanel.topMargin = dp(52)
+        box.addView(panel, lpPanel)
+        rdPanel = panel
+
+        // Untere Leiste: Seitenregler und Seitenzahl
+        val bottom = LinearLayout(this)
+        bottom.orientation = LinearLayout.VERTICAL
+        bottom.setBackgroundColor(rdBar())
+        bottom.setPadding(dp(16), dp(10), dp(16), dp(12))
+        val seek = SeekBar(this)
+        seek.max = maxOf(1, pageCount - 1)
+        seek.progress = start
+        tintSeek(seek)
+        val pill = TextView(this)
+        pill.text = "${start + 1} / $pageCount"
+        pill.textSize = 16f
+        pill.setTextColor(rdBarFg())
+        pill.gravity = Gravity.CENTER
+        pill.setPadding(dp(22), dp(8), dp(22), dp(8))
+        val gp = GradientDrawable()
+        gp.setColor(Color.TRANSPARENT)
+        gp.setStroke(dp(1), rdBarFg())
+        gp.cornerRadius = dp(22).toFloat()
+        pill.background = gp
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                rdPos = p
+                pill.text = "${p + 1} / $pageCount"
+                rdLm.scrollToPositionWithOffset(p, 0)
+            }
+
+            override fun onStartTrackingTouch(s: SeekBar) {
+                rdSeeking = true
+            }
+
+            override fun onStopTrackingTouch(s: SeekBar) {
+                rdSeeking = false
+            }
+        })
+        bottom.addView(seek)
+        val pillLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        pillLp.gravity = Gravity.CENTER_HORIZONTAL
+        pillLp.topMargin = dp(6)
+        bottom.addView(pill, pillLp)
+        box.addView(bottom, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+        rdBottom = bottom
+        rdSeek = seek
+        rdPill = pill
+
+        content.addView(box, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        rdPos = start
+        rdLm.scrollToPositionWithOffset(start, 0)
+    }
+
+    private fun setReaderBars(show: Boolean) {
+        val v = if (show) View.VISIBLE else View.GONE
+        rdTop?.visibility = v
+        rdBottom?.visibility = v
+        if (!show) rdPanel?.visibility = View.GONE
+    }
+
+    private fun toggleReaderBars() {
+        setReaderBars(rdTop?.visibility != View.VISIBLE)
+    }
+
+    private fun rdCurrent(): Int {
+        if (!this::rdList.isInitialized) return 0
+        val c = rdList.findChildViewUnder(rdList.width / 2f, rdList.height / 3f)
+        val p = if (c != null) rdList.getChildAdapterPosition(c) else rdLm.findFirstVisibleItemPosition()
+        return p.coerceIn(0, maxOf(0, pageCount - 1))
+    }
+
+    private fun rdSync() {
+        val p = rdCurrent()
+        rdPos = p
+        if (!rdSeeking) rdSeek?.progress = p
+        rdPill?.text = "${p + 1} / $pageCount"
+    }
+
+    inner class ReaderAdapter : RecyclerView.Adapter<RVH>() {
+        override fun getItemCount(): Int = pageCount
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RVH {
+            val tv = TextView(this@MainActivity)
+            tv.layoutParams = RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            tv.setOnClickListener { toggleReaderBars() }
+            return RVH(tv)
+        }
+
+        override fun onBindViewHolder(holder: RVH, position: Int) {
+            val tv = holder.tv
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, rdSize.toFloat())
+            tv.setTextColor(rdFg())
+            tv.typeface = if (rdSerif) Typeface.SERIF else Typeface.SANS_SERIF
+            tv.setLineSpacing(0f, 1.32f)
+            tv.setPadding(dp(22), dp(8), dp(22), dp(8))
+            val txt = rdCache.get(position)
+            if (txt == null) {
+                tv.text = "…"
+                tv.minimumHeight = dp(320)
+            } else {
+                tv.text = txt
+                tv.minimumHeight = 0
+            }
+            rdRequest(position)
+            rdRequest(position + 1)
+            rdRequest(position + 2)
+            rdRequest(position - 1)
+        }
+    }
+
+    /** Fragt eine Seite zum Auslesen an; ein Hintergrundlauf arbeitet die nächstliegenden Seiten zuerst ab. */
+    private fun rdRequest(p: Int) {
+        if (p < 0 || p >= pageCount || rdCache.get(p) != null) return
+        rdWanted.add(p)
+        if (!rdWorker) {
+            rdWorker = true
+            startReaderWorker()
+        }
+    }
+
+    private fun startReaderWorker() {
+        val f = currentFile
+        if (f == null) {
+            rdWorker = false
+            return
+        }
+        val token = loadToken
+        auxExec.execute {
+            try {
+                while (token == loadToken && readerOpen) {
+                    var best = -1
+                    var bd = Int.MAX_VALUE
+                    val c = rdPos
+                    for (w in rdWanted) {
+                        val d = abs(w - c)
+                        if (d < bd) {
+                            bd = d
+                            best = w
+                        }
+                    }
+                    if (best < 0) break
+                    rdWanted.remove(best)
+                    if (bd > 8) continue
+                    if (rdCache.get(best) != null) continue
+                    val res: CharSequence = try {
+                        extractReaderPage(f, best)
+                    } catch (e: Throwable) {
+                        "Diese Seite konnte nicht gelesen werden."
+                    }
+                    if (token != loadToken) break
+                    main.post {
+                        if (token == loadToken && readerOpen) {
+                            rdCache.put(best, res)
+                            rdAdapter.notifyItemChanged(best)
+                        }
+                    }
+                }
+            } finally {
+                main.post {
+                    rdWorker = false
+                    if (readerOpen && rdWanted.isNotEmpty()) {
+                        rdWorker = true
+                        startReaderWorker()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun extractReaderPage(f: File, p: Int): CharSequence {
+        val d = openAux(f)
+        val st = PDFTextStripper()
+        st.setStartPage(p + 1)
+        st.setEndPage(p + 1)
+        return formatReaderText(st.getText(d))
+    }
+
+    private fun joinLine(p: RPara, l: String) {
+        val t = p.text
+        p.lines++
+        if (t.endsWith("-") && t.length >= 2 && l.isNotEmpty()) {
+            val before = t[t.length - 2]
+            p.text = if (before.isLowerCase() && l[0].isLowerCase()) t.substring(0, t.length - 1) + l else t + l
+        } else {
+            p.text = t + " " + l
+        }
+    }
+
+    /** Macht aus dem zeilenweisen PDF-Text fließende Absätze mit Überschriften und Aufzählungen. */
+    private fun formatReaderText(raw: String): CharSequence {
+        val lines = raw.replace("\r", "").split("\n")
+        var maxLen = 0
+        for (l in lines) maxLen = maxOf(maxLen, l.trim().length)
+        val paras = ArrayList<RPara>()
+        var cur: RPara? = null
+        var prev = ""
+        for (l0 in lines) {
+            val l = l0.trim()
+            if (l.isEmpty()) {
+                cur = null
+                prev = ""
+                continue
+            }
+            if (l.length <= 4 && l.all { it.isDigit() }) continue
+            val m = bulletRe.find(l)
+            if (m != null) {
+                val mk = m.groupValues[1]
+                val p = RPara(l.substring(m.range.last + 1).trim(), 2, if (mk[0].isDigit()) mk else "•")
+                paras.add(p)
+                cur = p
+                prev = l
+                continue
+            }
+            val c = cur
+            if (c == null) {
+                val p = RPara(l, 0)
+                paras.add(p)
+                cur = p
+                prev = l
+                continue
+            }
+            val endsSentence = prev.isNotEmpty() && ".!?:)\"”".indexOf(prev.last()) >= 0
+            val shortPrev = prev.length < maxLen * 0.72f
+            if ((shortPrev && endsSentence) || prev.length < maxLen * 0.45f) {
+                val p = RPara(l, 0)
+                paras.add(p)
+                cur = p
+            } else {
+                joinLine(c, l)
+            }
+            prev = l
+        }
+        for (p in paras) {
+            if (p.kind == 0 && p.lines == 1 && p.text.length in 2..70 &&
+                ".,;:!?".indexOf(p.text.last()) < 0 && (p.text[0].isUpperCase() || p.text[0].isDigit())
+            ) p.kind = 1
+        }
+        val fl = Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        val sb = SpannableStringBuilder()
+        if (paras.isEmpty()) {
+            sb.append("Auf dieser Seite wurde kein Text gefunden (Bild oder gescannte Seite).")
+            sb.setSpan(StyleSpan(Typeface.ITALIC), 0, sb.length, fl)
+            return sb
+        }
+        for (i in paras.indices) {
+            val p = paras[i]
+            if (i > 0) {
+                sb.append("\n\n")
+                sb.setSpan(RelativeSizeSpan(0.45f), sb.length - 1, sb.length, fl)
+            }
+            val s = sb.length
+            if (p.kind == 2) {
+                sb.append(p.marker).append("\u00A0\u00A0").append(p.text)
+                sb.setSpan(LeadingMarginSpan.Standard(dp(4), dp(24)), s, sb.length, fl)
+            } else if (p.kind == 1) {
+                sb.append(p.text)
+                sb.setSpan(StyleSpan(Typeface.BOLD), s, sb.length, fl)
+                sb.setSpan(RelativeSizeSpan(1.12f), s, sb.length, fl)
+            } else {
+                sb.append(p.text)
+            }
+        }
+        return sb
+    }
+
+    // ------------------------------------------------------------ Zuletzt geöffnet
+
+    private class Recent(val uri: String, val name: String, val time: Long, var page: Int)
+
+    private fun loadRecents(): MutableList<Recent> {
+        val s = getSharedPreferences("einstellungen", MODE_PRIVATE).getString("recent", "") ?: ""
+        val out = ArrayList<Recent>()
+        for (line in s.split("\n")) {
+            val p = line.split("\t")
+            if (p.size >= 4) out.add(Recent(p[0], p[1], p[2].toLongOrNull() ?: 0L, p[3].toIntOrNull() ?: 0))
+        }
+        return out
+    }
+
+    private fun storeRecents(l: List<Recent>) {
+        val s = l.joinToString("\n") { it.uri + "\t" + it.name + "\t" + it.time + "\t" + it.page }
+        getSharedPreferences("einstellungen", MODE_PRIVATE).edit().putString("recent", s).apply()
+    }
+
+    private fun releaseUri(u: String) {
+        try {
+            contentResolver.releasePersistableUriPermission(Uri.parse(u), Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun addRecent(u: Uri, name: String) {
+        if (u.scheme != "content") return
+        val us = u.toString()
+        val l = loadRecents()
+        val old = l.firstOrNull { it.uri == us }
+        l.removeAll { it.uri == us }
+        l.add(0, Recent(us, name.replace('\t', ' ').replace('\n', ' '), System.currentTimeMillis(), old?.page ?: 0))
+        while (l.size > 15) {
+            val gone = l.removeAt(l.size - 1)
+            releaseUri(gone.uri)
+        }
+        storeRecents(l)
+    }
+
+    private fun removeRecent(uri: String) {
+        val l = loadRecents()
+        l.removeAll { it.uri == uri }
+        storeRecents(l)
+        releaseUri(uri)
+    }
+
+    private fun updateRecentPage(page: Int) {
+        val l = loadRecents()
+        val u = currentUriStr
+        val r = (if (u != null) l.firstOrNull { it.uri == u } else null) ?: l.firstOrNull { it.name == currentName } ?: return
+        if (r.page == page) return
+        r.page = page
+        storeRecents(l)
+    }
+
+    private fun showRecents() {
+        val l = loadRecents()
+        if (l.isEmpty()) {
+            toast("Noch keine zuletzt geöffneten Dateien.")
+            return
+        }
+        val now = System.currentTimeMillis()
+        val items = Array<CharSequence>(l.size) { i ->
+            val r = l[i]
+            val ago = DateUtils.getRelativeTimeSpanString(r.time, now, DateUtils.MINUTE_IN_MILLIS, DateUtils.FORMAT_ABBREV_RELATIVE)
+            r.name + "\n" + ago + (if (r.page > 0) " · Seite ${r.page + 1}" else "")
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Zuletzt geöffnet")
+            .setItems(items) { _, i -> openRecent(l[i]) }
+            .setNeutralButton("Liste leeren") { _, _ ->
+                for (r in l) releaseUri(r.uri)
+                storeRecents(emptyList())
+            }
+            .setNegativeButton("Schließen", null)
+            .show()
+    }
+
+    private fun openRecent(r: Recent) {
+        val u = Uri.parse(r.uri)
+        confirmDiscard {
+            var ok = true
+            try {
+                val s = contentResolver.openInputStream(u)
+                if (s == null) ok = false else s.close()
+            } catch (e: Throwable) {
+                ok = false
+            }
+            if (!ok) {
+                toast("„" + r.name + "“ ist nicht mehr zugänglich. Bitte über „PDF öffnen“ neu auswählen.")
+                removeRecent(r.uri)
+            } else {
+                closeMenu()
+                openPdf(u)
+            }
+        }
+    }
+
     // ---- Schnellscroll-Leiste
 
     private fun totalHeight(): Long {
@@ -2423,20 +3112,6 @@ class MainActivity : Activity() {
         if (hasFocus && readingMode) applySystemUi()
     }
 
-    private fun toggleReading() {
-        readingMode = !readingMode
-        getSharedPreferences("einstellungen", MODE_PRIVATE).edit().putBoolean("reading", readingMode).apply()
-        applySystemUi()
-        pageInd.visibility = if (readingMode && pageCount > 0) View.VISIBLE else View.GONE
-        updatePageInd()
-        refreshVisible()
-        closeMenu()
-        hideBar()
-        if (readingMode) {
-            toast("Lesemodus an: Vollbild, Bildschirm bleibt an, warmer Papierton (im hellen Modus). Tippe auf die Seite, um die Leiste zu holen.")
-        }
-    }
-
     private fun updatePageInd() {
         if (!this::pageInd.isInitialized || pageCount == 0) return
         var p = -1
@@ -2463,7 +3138,7 @@ class MainActivity : Activity() {
     }
 
     private fun startImagePrefetch() {
-        if (!darkMode || pageCount == 0) return
+        if (!darkMode || pageCount == 0 || readerOpen) return
         val f = currentFile ?: return
         val token = loadToken
         if (prefetchFor == token) return
@@ -2472,7 +3147,7 @@ class MainActivity : Activity() {
             var fails = 0
             val seen = HashSet<Int>()
             try {
-                while (token == loadToken && darkMode && fails < 3) {
+                while (token == loadToken && darkMode && !readerOpen && fails < 3) {
                     val p = nextUndetected(seen)
                     if (p < 0) break
                     seen.add(p)
@@ -2901,6 +3576,7 @@ class MainActivity : Activity() {
         i.addCategory(Intent.CATEGORY_OPENABLE)
         i.type = mime
         if (req == REQ_MERGE || req == REQ_IMAGES) i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        if (req == REQ_OPEN) i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         startActivityForResult(i, req)
     }
 
@@ -2924,7 +3600,13 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode != RESULT_OK || data == null) return
         when (requestCode) {
-            REQ_OPEN -> data.data?.let { openPdf(it) }
+            REQ_OPEN -> data.data?.let { u ->
+                try {
+                    contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                } catch (e: Exception) {
+                }
+                openPdf(u)
+            }
             REQ_MERGE -> {
                 val list = urisOf(data)
                 if (list.size < 2) {
