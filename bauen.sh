@@ -25,7 +25,7 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "quackreader"
+rootProject.name = "quackly"
 include(":app")
 EOF
 
@@ -104,7 +104,7 @@ EOF
 sed -i "s/versionCode = 4/versionCode = $((100 + ${GITHUB_RUN_NUMBER:-0}))/" app/build.gradle.kts
 sed -i "s/versionName = \"4.0\"/versionName = \"5.${GITHUB_RUN_NUMBER:-0}\"/" app/build.gradle.kts
 
-# ---- Logo (QuackReader-Ente) ----
+# ---- Logo (Quackly-Ente) ----
 cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
 <?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
@@ -126,7 +126,7 @@ EOF
 cat > app/src/main/res/values/strings.xml <<'EOF'
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">QuackReader</string>
+    <string name="app_name">Quackly</string>
 </resources>
 EOF
 
