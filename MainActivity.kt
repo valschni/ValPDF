@@ -70,10 +70,13 @@ import com.tom_roush.pdfbox.multipdf.PDFMergerUtility
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
+import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
 import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
 import com.tom_roush.pdfbox.pdmodel.graphics.form.PDFormXObject
+import com.tom_roush.pdfbox.pdmodel.graphics.image.JPEGFactory
 import com.tom_roush.pdfbox.pdmodel.graphics.image.LosslessFactory
 import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
+import com.tom_roush.pdfbox.pdmodel.graphics.state.RenderingMode
 import com.tom_roush.pdfbox.pdmodel.interactive.annotation.PDAnnotationWidget
 import com.tom_roush.pdfbox.pdmodel.interactive.form.PDCheckBox
 import com.tom_roush.pdfbox.pdmodel.interactive.form.PDChoice
@@ -84,6 +87,10 @@ import com.tom_roush.pdfbox.pdmodel.interactive.form.PDRadioButton
 import com.tom_roush.pdfbox.pdmodel.interactive.form.PDTerminalField
 import com.tom_roush.pdfbox.pdmodel.interactive.form.PDTextField
 import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.tom_roush.pdfbox.text.TextPosition
 import java.io.File
 import java.io.OutputStream
@@ -986,6 +993,11 @@ class MainActivity : Activity() {
         menuPanel.addView(menuItem("🖼   Bilder zu PDF") {
             closeMenu()
             confirmDiscard { pick("image/*", REQ_IMAGES) }
+        })
+        menuPanel.addView(divider())
+        menuPanel.addView(menuItem("🔎   Gescannte PDF durchsuchbar machen") {
+            closeMenu()
+            confirmDiscard { startOcrPdf() }
         })
         menuPanel.addView(divider())
         menuPanel.addView(menuItem(if (darkMode) "☀   Heller Modus" else "🌙   Dunkelmodus") { toggleDark() })
@@ -3653,6 +3665,8 @@ class MainActivity : Activity() {
                         mergeTo(uris, out)
                     } else if (mode == 3) {
                         if (src != null) saveEdited(src, snap, dw, dh, out)
+                    } else if (mode == 4) {
+                        if (src != null) ocrPdfTo(src, out)
                     } else {
                         imagesTo(uris, out)
                     }
@@ -3676,6 +3690,329 @@ class MainActivity : Activity() {
         for (u in uris) m.addSource(contentResolver.openInputStream(u))
         m.setDestinationStream(out)
         m.mergeDocuments(MemoryUsageSetting.setupMainMemoryOnly())
+    }
+
+    // ---- Texterkennung für gescannte PDFs
+
+    private fun startOcrPdf() {
+        val f = currentFile
+        if (pageCount == 0 || f == null) {
+            toast("Bitte zuerst eine PDF öffnen.")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Text erkennen")
+            .setMessage(
+                "Seiten ohne Text werden per Texterkennung durchsuchbar gemacht. " +
+                    "Das Ergebnis wird als neue PDF gespeichert, das Original bleibt unverändert.\n\n" +
+                    "Bei $pageCount Seiten kann das einige Minuten dauern. Lass die App dabei geöffnet."
+            )
+            .setPositiveButton("Starten") { _, _ ->
+                pendingMode = 4
+                val base = if (currentName.endsWith(".pdf", true)) currentName.dropLast(4) else currentName
+                askSave(base + "_durchsuchbar.pdf")
+            }
+            .setNegativeButton("Abbrechen", null)
+            .show()
+    }
+
+    /** Legt auf Seiten ohne Text eine unsichtbare Textebene aus der Texterkennung. Alles andere bleibt unverändert. */
+    private fun ocrPdfTo(src: File, out: OutputStream) {
+        main.post { window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+        val pfd = android.os.ParcelFileDescriptor.open(src, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+        val renderer = PdfRenderer(pfd)
+        val doc = PDDocument.load(src, MemoryUsageSetting.setupMixed(64L * 1024 * 1024))
+        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        var done = 0
+        var skipped = 0
+        var fails = 0
+        try {
+            val n = minOf(renderer.pageCount, doc.numberOfPages)
+            val stripper = PDFTextStripper()
+            for (p in 0 until n) {
+                main.post { setStatus("Texterkennung: Seite ${p + 1} von $n …") }
+                val page = doc.getPage(p)
+                val existing = try {
+                    stripper.setStartPage(p + 1)
+                    stripper.setEndPage(p + 1)
+                    stripper.getText(doc).trim()
+                } catch (e: Throwable) {
+                    ""
+                }
+                if (existing.length >= 25) {
+                    skipped++
+                    continue
+                }
+                var bmp: Bitmap? = null
+                try {
+                    val rp = renderer.openPage(p)
+                    try {
+                        val scale = minOf(2600f / maxOf(rp.width, rp.height), 3f).coerceAtLeast(1f)
+                        val bw = maxOf(1, (rp.width * scale).toInt())
+                        val bh = maxOf(1, (rp.height * scale).toInt())
+                        val b = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+                        b.eraseColor(Color.WHITE)
+                        rp.render(b, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        bmp = b
+                    } finally {
+                        rp.close()
+                    }
+                    val b = bmp!!
+                    val res = Tasks.await(recognizer.process(InputImage.fromBitmap(b, 0)))
+                    val cs = PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true)
+                    try {
+                        addInvisibleTextPage(cs, res, b.width.toFloat(), b.height.toFloat(), page)
+                    } finally {
+                        try {
+                            cs.close()
+                        } catch (e: Throwable) {
+                        }
+                    }
+                    done++
+                } catch (e: Throwable) {
+                    fails++
+                } finally {
+                    bmp?.recycle()
+                }
+            }
+            main.post { setStatus("Speichere PDF …") }
+            doc.save(out)
+            main.post {
+                toast("Fertig: Text auf $done Seite(n) erkannt, $skipped hatten schon Text" + (if (fails > 0) ", $fails ohne Ergebnis." else "."))
+            }
+        } finally {
+            try {
+                recognizer.close()
+            } catch (e: Throwable) {
+            }
+            doc.close()
+            try {
+                renderer.close()
+            } catch (e: Throwable) {
+            }
+            try {
+                pfd.close()
+            } catch (e: Throwable) {
+            }
+            main.post { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+        }
+    }
+
+    /** Wie addInvisibleText, aber für vorhandene PDF-Seiten (berücksichtigt Drehung und Zuschnitt der Seite). */
+    private fun addInvisibleTextPage(
+        cs: PDPageContentStream,
+        t: com.google.mlkit.vision.text.Text,
+        bw: Float, bh: Float, page: PDPage
+    ) {
+        val cb = page.cropBox
+        val rot = ((page.rotation % 360) + 360) % 360
+        val dispW = if (rot == 90 || rot == 270) cb.height else cb.width
+        val dispH = if (rot == 90 || rot == 270) cb.width else cb.height
+        val rad = Math.toRadians(rot.toDouble())
+        val cosT = Math.cos(rad).toFloat()
+        val sinT = Math.sin(rad).toFloat()
+
+        fun user(fx: Float, fy: Float): FloatArray {
+            val u: Float
+            val v: Float
+            when (rot) {
+                90 -> {
+                    u = fy
+                    v = fx
+                }
+                180 -> {
+                    u = 1f - fx
+                    v = fy
+                }
+                270 -> {
+                    u = 1f - fy
+                    v = 1f - fx
+                }
+                else -> {
+                    u = fx
+                    v = 1f - fy
+                }
+            }
+            return floatArrayOf(cb.lowerLeftX + u * cb.width, cb.lowerLeftY + v * cb.height)
+        }
+
+        val font = PDType1Font.HELVETICA
+        val okChars = HashMap<Char, Boolean>()
+        for (block in t.textBlocks) {
+            for (line in block.lines) {
+                for (el in line.elements) {
+                    val box = el.boundingBox ?: continue
+                    val sbd = StringBuilder()
+                    for (ch in el.text) {
+                        val ok = okChars.getOrPut(ch) {
+                            try {
+                                font.encode(ch.toString())
+                                true
+                            } catch (e: Exception) {
+                                false
+                            }
+                        }
+                        if (ok) sbd.append(ch)
+                    }
+                    val txt = sbd.toString()
+                    if (txt.isEmpty()) continue
+                    val boxW = box.width() / bw * dispW
+                    val boxH = box.height() / bh * dispH
+                    if (boxW < 1f || boxH < 1f) continue
+                    val size = boxH * 0.85f
+                    val natural = font.getStringWidth(txt) / 1000f * size
+                    if (natural <= 0f) continue
+                    val hs = boxW / natural
+                    val pos = user(box.left / bw, box.bottom / bh - 0.2f * boxH / dispH)
+                    cs.beginText()
+                    cs.setRenderingMode(RenderingMode.NEUTRAL)
+                    cs.setFont(font, size)
+                    cs.setTextMatrix(com.tom_roush.pdfbox.util.Matrix(hs * cosT, hs * sinT, -sinT, cosT, pos[0], pos[1]))
+                    cs.showText(txt)
+                    cs.endText()
+                }
+            }
+        }
+    }
+
+    private fun loadBitmap(u: Uri): Bitmap? {
+        val bounds = BitmapFactory.Options()
+        bounds.inJustDecodeBounds = true
+        contentResolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        var s = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / s > 2400) s *= 2
+        val o = BitmapFactory.Options()
+        o.inSampleSize = s
+        val bmp = contentResolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it, null, o) }
+            ?: return null
+        var rot = 0f
+        try {
+            contentResolver.openInputStream(u)?.use {
+                val ori = ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1)
+                rot = when (ori) {
+                    6 -> 90f
+                    3 -> 180f
+                    8 -> 270f
+                    else -> 0f
+                }
+            }
+        } catch (e: Exception) {
+        }
+        if (rot == 0f) return bmp
+        val mx = Matrix()
+        mx.postRotate(rot)
+        return Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, mx, true)
+    }
+
+    /** Bilder zu PDF: Seiten mit Foto plus unsichtbarer Textebene (Texterkennung), damit der Text durchsuchbar ist. */
+    private fun imagesTo(uris: List<Uri>, out: OutputStream) {
+        val doc = PDDocument()
+        val recognizer = try {
+            TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        } catch (e: Throwable) {
+            null
+        }
+        var pageNo = 0
+        var ocrFails = 0
+        try {
+            for ((idx, u) in uris.withIndex()) {
+                val loaded = loadBitmap(u) ?: continue
+                val bmp = flattenOnWhite(loaded)
+                pageNo++
+                main.post { setStatus("Erstelle PDF … Bild ${idx + 1} von ${uris.size} (Text wird erkannt)") }
+                val pw = 595f
+                val ph = maxOf(1, (595f * bmp.height / bmp.width).toInt()).toFloat()
+                val page = PDPage(PDRectangle(pw, ph))
+                doc.addPage(page)
+                val img = JPEGFactory.createFromImage(doc, bmp, 0.88f)
+                val cs = PDPageContentStream(doc, page)
+                try {
+                    cs.drawImage(img, 0f, 0f, pw, ph)
+                    if (recognizer != null) {
+                        try {
+                            val res = Tasks.await(recognizer.process(InputImage.fromBitmap(bmp, 0)))
+                            addInvisibleText(cs, res, bmp.width.toFloat(), bmp.height.toFloat(), pw, ph)
+                        } catch (e: Throwable) {
+                            ocrFails++
+                        }
+                    }
+                } finally {
+                    try {
+                        cs.close()
+                    } catch (e: Throwable) {
+                    }
+                }
+                if (bmp !== loaded) loaded.recycle()
+                bmp.recycle()
+            }
+            if (pageNo == 0) throw IllegalStateException("Keine Bilder lesbar")
+            doc.save(out)
+        } finally {
+            try {
+                recognizer?.close()
+            } catch (e: Throwable) {
+            }
+            doc.close()
+        }
+        if (ocrFails > 0) main.post { toast("Bei $ocrFails Bild(ern) konnte kein Text erkannt werden.") }
+    }
+
+    /** Bilder mit Transparenz (z. B. PNG) auf weißen Grund legen, damit sie als JPEG nicht schwarz werden. */
+    private fun flattenOnWhite(b: Bitmap): Bitmap {
+        if (!b.hasAlpha()) return b
+        val o = Bitmap.createBitmap(b.width, b.height, Bitmap.Config.ARGB_8888)
+        val c = Canvas(o)
+        c.drawColor(Color.WHITE)
+        c.drawBitmap(b, 0f, 0f, null)
+        return o
+    }
+
+    /** Schreibt die erkannten Wörter unsichtbar (Textmodus 3) an ihre Position im Bild. */
+    private fun addInvisibleText(
+        cs: PDPageContentStream,
+        t: com.google.mlkit.vision.text.Text,
+        bw: Float, bh: Float, pw: Float, ph: Float
+    ) {
+        val font = PDType1Font.HELVETICA
+        val sx = pw / bw
+        val sy = ph / bh
+        val okChars = HashMap<Char, Boolean>()
+        for (block in t.textBlocks) {
+            for (line in block.lines) {
+                for (el in line.elements) {
+                    val box = el.boundingBox ?: continue
+                    val sbd = StringBuilder()
+                    for (ch in el.text) {
+                        val ok = okChars.getOrPut(ch) {
+                            try {
+                                font.encode(ch.toString())
+                                true
+                            } catch (e: Exception) {
+                                false
+                            }
+                        }
+                        if (ok) sbd.append(ch)
+                    }
+                    val txt = sbd.toString()
+                    if (txt.isEmpty()) continue
+                    val boxW = box.width() * sx
+                    val boxH = box.height() * sy
+                    if (boxW < 1f || boxH < 1f) continue
+                    val size = boxH * 0.85f
+                    val natural = font.getStringWidth(txt) / 1000f * size
+                    if (natural <= 0f) continue
+                    val hs = boxW / natural
+                    val x = box.left * sx
+                    val y = ph - box.bottom * sy + boxH * 0.2f
+                    cs.beginText()
+                    cs.setRenderingMode(RenderingMode.NEUTRAL)
+                    cs.setFont(font, size)
+                    cs.setTextMatrix(com.tom_roush.pdfbox.util.Matrix(hs, 0f, 0f, 1f, x, y))
+                    cs.showText(txt)
+                    cs.endText()
+                }
+            }
+        }
     }
 
     private fun loadBitmap(u: Uri): Bitmap? {

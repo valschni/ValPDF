@@ -97,6 +97,7 @@ android {
 dependencies {
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+    implementation("com.google.mlkit:text-recognition:16.0.1")
 }
 EOF
 
